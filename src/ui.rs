@@ -11,6 +11,7 @@ use ratatui::{
 };
 
 use crate::app::{App, DraftServer, Field, Mode, StatusKind};
+use crate::config::Server;
 use crate::theme::{theme, Theme};
 
 /// Terminal width at which the dashboard switches from a compact single-line
@@ -388,11 +389,44 @@ fn render_main(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     }
 }
 
+/// Recency treatment for a server row's trailing status dot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowRecency {
+    /// The most recently connected server; gets a dim `recent` tag.
+    Recent,
+    /// Connected before, but not most recently.
+    Connected,
+    /// Never connected; the status dot renders dimmed.
+    Never,
+}
+
+/// Index of the most recently connected server, if any has been connected.
+fn most_recent_index(servers: &[Server]) -> Option<usize> {
+    servers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, server)| server.last_connected_at.map(|at| (at, i)))
+        .max_by_key(|&(at, _)| at)
+        .map(|(_, i)| i)
+}
+
 /// One server row: `  ❯ ▣ name ······ ●  `, padded to exactly `width`
-/// characters so the selection bar can tint the full card width.
-fn server_row_line(name: &str, selected: bool, width: usize, t: &Theme) -> Line<'static> {
+/// characters so the selection bar can tint the full card width. The most
+/// recently used server carries a dim `recent` tag before its dot.
+fn server_row_line(
+    name: &str,
+    selected: bool,
+    width: usize,
+    recency: RowRecency,
+    t: &Theme,
+) -> Line<'static> {
+    let tag = if recency == RowRecency::Recent {
+        "recent "
+    } else {
+        ""
+    };
     // Chrome around the name: 2 lead + 2 chevron + 2 icon + 1 dot + 2 trail.
-    let chrome = 9;
+    let chrome = 9 + tag.chars().count();
     let label = truncate_label(name, width.saturating_sub(chrome + 1));
     let pad = width.saturating_sub(chrome + label.chars().count()).max(1);
 
@@ -412,6 +446,12 @@ fn server_row_line(name: &str, selected: bool, width: usize, t: &Theme) -> Line<
         )
     };
 
+    let dot_color = if recency == RowRecency::Never {
+        t.muted
+    } else {
+        t.green
+    };
+
     let line = Line::from(vec![
         Span::raw("  "),
         Span::styled(
@@ -421,7 +461,8 @@ fn server_row_line(name: &str, selected: bool, width: usize, t: &Theme) -> Line<
         Span::styled("▣ ", icon_style),
         Span::styled(label, name_style),
         Span::raw(" ".repeat(pad)),
-        Span::styled("●", Style::default().fg(t.green)),
+        Span::styled(tag.to_string(), Style::default().fg(t.muted)),
+        Span::styled("●", Style::default().fg(dot_color)),
         Span::raw("  "),
     ]);
 
@@ -470,6 +511,7 @@ fn render_server_card(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let visible = visible_rows(inner.height);
     let offset = scroll_offset(app.selected, total, visible);
 
+    let most_recent = most_recent_index(&app.config.servers);
     let mut lines = card_header_lines(inner.width, t);
     for (i, server) in app
         .config
@@ -479,10 +521,18 @@ fn render_server_card(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .skip(offset)
         .take(visible)
     {
+        let recency = if most_recent == Some(i) {
+            RowRecency::Recent
+        } else if server.last_connected_at.is_some() {
+            RowRecency::Connected
+        } else {
+            RowRecency::Never
+        };
         lines.push(server_row_line(
             &server.name,
             i == app.selected,
             inner.width as usize,
+            recency,
             t,
         ));
     }
@@ -726,6 +776,7 @@ mod tests {
             username: None,
             identity_file: None,
             extra_args: None,
+            last_connected_at: None,
         }
     }
 
@@ -808,10 +859,28 @@ mod tests {
     fn server_row_line_fills_exact_width() {
         for width in [20usize, 40, 60] {
             for selected in [false, true] {
-                let line = server_row_line("staging-eu-west", selected, width, &Theme::TRUECOLOR);
-                assert_eq!(line.width(), width);
+                for recency in [RowRecency::Recent, RowRecency::Connected, RowRecency::Never] {
+                    let line = server_row_line(
+                        "staging-eu-west",
+                        selected,
+                        width,
+                        recency,
+                        &Theme::TRUECOLOR,
+                    );
+                    assert_eq!(line.width(), width, "width {width}, recency {recency:?}");
+                }
             }
         }
+    }
+
+    #[test]
+    fn most_recent_index_finds_latest_connection() {
+        let mut servers = vec![sample_server("a"), sample_server("b"), sample_server("c")];
+        assert_eq!(most_recent_index(&servers), None);
+
+        servers[0].last_connected_at = Some(100);
+        servers[2].last_connected_at = Some(300);
+        assert_eq!(most_recent_index(&servers), Some(2));
     }
 
     #[test]
@@ -937,6 +1006,8 @@ mod tests {
         ] {
             app.config.add(sample_server(name));
         }
+        app.config.mark_connected(0, 200);
+        app.config.mark_connected(3, 100);
         app.selected = 0;
 
         let backend = TestBackend::new(100, 34);

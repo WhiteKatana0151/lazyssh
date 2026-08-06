@@ -130,6 +130,7 @@ impl DraftServer {
             username: optional_trimmed(&self.username),
             identity_file: optional_trimmed(&self.identity_file),
             extra_args: optional_trimmed(&self.extra_args),
+            last_connected_at: None,
         })
     }
 }
@@ -184,7 +185,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: Config) -> Self {
+    pub fn new(mut config: Config) -> Self {
+        // Most recently connected first, so the last-used server is already
+        // selected on launch.
+        config.sort_by_recency();
         Self {
             config,
             selected: 0,
@@ -274,7 +278,7 @@ impl App {
                 self.mode = Mode::Normal;
                 match editing {
                     Some(index) if index < self.config.servers.len() => {
-                        self.config.update(index, server);
+                        self.config.update_preserving_recency(index, server);
                         self.selected = index;
                         self.set_status(StatusKind::Success, format!("Updated {name}"));
                     }
@@ -384,6 +388,19 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<AppExit>> {
 mod tests {
     use super::*;
 
+    fn sample_server(name: &str) -> Server {
+        Server {
+            name: name.to_string(),
+            description: String::new(),
+            host: "example.com".to_string(),
+            port: None,
+            username: None,
+            identity_file: None,
+            extra_args: None,
+            last_connected_at: None,
+        }
+    }
+
     #[test]
     fn draft_requires_name_and_host() {
         let draft = DraftServer {
@@ -443,10 +460,37 @@ mod tests {
             username: Some("deploy".to_string()),
             identity_file: None,
             extra_args: Some("-A".to_string()),
+            last_connected_at: None,
         };
 
         let rebuilt = DraftServer::from_server(&server).to_server().unwrap();
         assert_eq!(rebuilt, server);
+    }
+
+    #[test]
+    fn drafts_build_servers_that_start_never_connected() {
+        let draft = DraftServer {
+            name: "prod".to_string(),
+            host: "example.com".to_string(),
+            ..DraftServer::default()
+        };
+        assert_eq!(draft.to_server().unwrap().last_connected_at, None);
+    }
+
+    #[test]
+    fn new_app_orders_servers_by_recency() {
+        let mut config = Config::default();
+        config.add(sample_server("never"));
+        config.add(sample_server("older"));
+        config.add(sample_server("newest"));
+        config.mark_connected(1, 100);
+        config.mark_connected(2, 200);
+
+        let app = App::new(config);
+        let names: Vec<_> = app.config.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["newest", "older", "never"]);
+        // Selection starts on the most recently used server.
+        assert_eq!(app.selected, 0);
     }
 
     #[test]
@@ -470,15 +514,7 @@ mod tests {
     #[test]
     fn edit_prefills_draft_from_selected_server() {
         let mut config = Config::default();
-        config.add(Server {
-            name: "prod".to_string(),
-            description: String::new(),
-            host: "example.com".to_string(),
-            port: None,
-            username: None,
-            identity_file: None,
-            extra_args: None,
-        });
+        config.add(sample_server("prod"));
         let mut app = App::new(config);
 
         app.open_edit();
@@ -492,15 +528,7 @@ mod tests {
     #[test]
     fn delete_requires_confirmation_dialog() {
         let mut config = Config::default();
-        config.add(Server {
-            name: "prod".to_string(),
-            description: String::new(),
-            host: "example.com".to_string(),
-            port: None,
-            username: None,
-            identity_file: None,
-            extra_args: None,
-        });
+        config.add(sample_server("prod"));
         let mut app = App::new(config);
 
         app.request_delete();

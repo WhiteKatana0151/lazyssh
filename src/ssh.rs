@@ -60,6 +60,7 @@ mod tests {
             username: None,
             identity_file: None,
             extra_args: None,
+            last_connected_at: None,
         }
     }
 

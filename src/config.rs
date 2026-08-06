@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,18 @@ pub struct Server {
     /// Extra arguments passed to `ssh` verbatim, split on whitespace.
     #[serde(default)]
     pub extra_args: Option<String>,
+    /// Unix timestamp (seconds) of the most recent connection. `None` means
+    /// never connected; `serde(default)` keeps older configs loading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_connected_at: Option<u64>,
+}
+
+/// Current Unix time in seconds, or 0 if the clock is before the epoch.
+pub fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +92,34 @@ impl Config {
         }
     }
 
+    /// Replaces the server at `index` while keeping its connection history,
+    /// so editing an entry never resets its recency.
+    pub fn update_preserving_recency(&mut self, index: usize, mut server: Server) -> bool {
+        if let Some(existing) = self.servers.get(index) {
+            server.last_connected_at = existing.last_connected_at;
+        }
+        self.update(index, server)
+    }
+
+    /// Stamps the server at `index` as connected at `at` (Unix seconds),
+    /// returning `false` if out of bounds.
+    pub fn mark_connected(&mut self, index: usize, at: u64) -> bool {
+        match self.servers.get_mut(index) {
+            Some(server) => {
+                server.last_connected_at = Some(at);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Orders servers most recently connected first. Never-connected servers
+    /// follow the connected ones, keeping their existing relative order.
+    pub fn sort_by_recency(&mut self) {
+        self.servers
+            .sort_by_key(|server| std::cmp::Reverse(server.last_connected_at));
+    }
+
     pub fn remove(&mut self, index: usize) -> Option<Server> {
         if index < self.servers.len() {
             Some(self.servers.remove(index))
@@ -101,6 +142,7 @@ mod tests {
             username: Some("root".to_string()),
             identity_file: Some("/home/user/.ssh/id_ed25519".to_string()),
             extra_args: Some("-o ServerAliveInterval=30".to_string()),
+            last_connected_at: None,
         }
     }
 
@@ -154,6 +196,59 @@ mod tests {
         assert_eq!(loaded.servers.len(), 1);
         assert_eq!(loaded.servers[0].port, None);
         assert_eq!(loaded.servers[0].extra_args, None);
+        assert_eq!(loaded.servers[0].last_connected_at, None);
+    }
+
+    #[test]
+    fn recency_survives_a_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("servers.json");
+
+        let mut config = Config::default();
+        config.add(sample_server("box1"));
+        config.mark_connected(0, 1_700_000_000);
+        config.save_to(&path).unwrap();
+
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.servers[0].last_connected_at, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn mark_connected_stamps_only_in_bounds() {
+        let mut config = Config::default();
+        config.add(sample_server("box1"));
+
+        assert!(config.mark_connected(0, 1700));
+        assert_eq!(config.servers[0].last_connected_at, Some(1700));
+        assert!(!config.mark_connected(5, 1700));
+    }
+
+    #[test]
+    fn sort_by_recency_puts_recent_first_and_never_last() {
+        let mut config = Config::default();
+        for name in ["a", "b", "c", "d"] {
+            config.add(sample_server(name));
+        }
+        config.mark_connected(1, 100);
+        config.mark_connected(3, 200);
+
+        config.sort_by_recency();
+        let names: Vec<_> = config.servers.iter().map(|s| s.name.as_str()).collect();
+        // Most recent first; never-connected keep their relative order.
+        assert_eq!(names, ["d", "b", "a", "c"]);
+    }
+
+    #[test]
+    fn update_preserving_recency_keeps_timestamp() {
+        let mut config = Config::default();
+        config.add(sample_server("box1"));
+        config.mark_connected(0, 1234);
+
+        assert!(config.update_preserving_recency(0, sample_server("box1-renamed")));
+        assert_eq!(config.servers[0].name, "box1-renamed");
+        assert_eq!(config.servers[0].last_connected_at, Some(1234));
+
+        assert!(!config.update_preserving_recency(5, sample_server("nope")));
     }
 
     #[test]

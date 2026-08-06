@@ -37,12 +37,18 @@ fn main() -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    if let Some(server) = app
-        .selected_server()
-        .filter(|_| matches!(result, Ok(AppExit::Connect)))
-    {
-        if let Err(err) = ssh::connect(server) {
-            eprintln!("failed to run ssh: {err}");
+    if matches!(result, Ok(AppExit::Connect)) && app.selected_server().is_some() {
+        // Record the connection before handing off: on Unix `connect` execs
+        // and never returns. A failed save shouldn't block the connection.
+        app.config
+            .mark_connected(app.selected, config::now_unix_secs());
+        if let Err(err) = app.config.save() {
+            eprintln!("warning: failed to save connection history: {err}");
+        }
+        if let Some(server) = app.selected_server() {
+            if let Err(err) = ssh::connect(server) {
+                eprintln!("failed to run ssh: {err}");
+            }
         }
     }
 
