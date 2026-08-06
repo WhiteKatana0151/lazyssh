@@ -6,10 +6,14 @@ It stores only connection metadata and SSH key paths. It does not store password
 
 ## Features
 
-- List saved SSH servers with name, description, and target.
+- Centered dashboard TUI with a large hollow neon LAZYSSH wordmark (green-to-cyan gradient outline) and tagline on wide terminals.
+- Bordered command bar footer with key badges, and a status line for feedback.
+- Blinking add-form cursor without busy-looping.
+- Responsive layout: full wordmark and server card on wide terminals, compact single-column fallback on narrow terminals.
+- List saved SSH servers by name in a centered card with airy rows, a full-width selection bar, and a status dot per row.
 - Add a server from the TUI.
 - Delete a server.
-- Connect to a selected server by execing `ssh`.
+- Connect to a selected server by launching `ssh`.
 - Persist entries at:
 
 ```text
@@ -50,6 +54,7 @@ Main screen:
 j / Down     move down
 k / Up       move up
 a            add server
+e            edit selected server (coming soon)
 d            delete selected server
 Enter        connect to selected server
 q / Esc      quit
