@@ -10,8 +10,14 @@ pub struct Server {
     pub name: String,
     pub description: String,
     pub host: String,
+    /// `serde(default)` keeps configs written before this field existed loading.
+    #[serde(default)]
+    pub port: Option<u16>,
     pub username: Option<String>,
     pub identity_file: Option<String>,
+    /// Extra arguments passed to `ssh` verbatim, split on whitespace.
+    #[serde(default)]
+    pub extra_args: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +68,17 @@ impl Config {
         self.servers.push(server);
     }
 
+    /// Replaces the server at `index`, returning `false` if out of bounds.
+    pub fn update(&mut self, index: usize, server: Server) -> bool {
+        match self.servers.get_mut(index) {
+            Some(slot) => {
+                *slot = server;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn remove(&mut self, index: usize) -> Option<Server> {
         if index < self.servers.len() {
             Some(self.servers.remove(index))
@@ -80,8 +97,10 @@ mod tests {
             name: name.to_string(),
             description: "test server".to_string(),
             host: "example.com".to_string(),
+            port: Some(2222),
             username: Some("root".to_string()),
             identity_file: Some("/home/user/.ssh/id_ed25519".to_string()),
+            extra_args: Some("-o ServerAliveInterval=30".to_string()),
         }
     }
 
@@ -119,6 +138,36 @@ mod tests {
         assert_eq!(removed.name, "box1");
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.servers[0].name, "box2");
+    }
+
+    #[test]
+    fn old_configs_without_new_fields_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("servers.json");
+        fs::write(
+            &path,
+            r#"{"servers":[{"name":"box1","description":"","host":"example.com","username":null,"identity_file":null}]}"#,
+        )
+        .unwrap();
+
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.servers.len(), 1);
+        assert_eq!(loaded.servers[0].port, None);
+        assert_eq!(loaded.servers[0].extra_args, None);
+    }
+
+    #[test]
+    fn update_replaces_in_place() {
+        let mut config = Config::default();
+        config.add(sample_server("box1"));
+
+        let mut replacement = sample_server("box1-renamed");
+        replacement.port = Some(2200);
+        assert!(config.update(0, replacement));
+        assert_eq!(config.servers[0].name, "box1-renamed");
+        assert_eq!(config.servers[0].port, Some(2200));
+
+        assert!(!config.update(5, sample_server("nope")));
     }
 
     #[test]

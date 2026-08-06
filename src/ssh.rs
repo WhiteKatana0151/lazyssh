@@ -14,6 +14,14 @@ pub fn build_command(server: &Server) -> Command {
         }
     }
 
+    if let Some(port) = server.port {
+        cmd.arg("-p").arg(port.to_string());
+    }
+
+    if let Some(extra) = &server.extra_args {
+        cmd.args(extra.split_whitespace());
+    }
+
     let target = match &server.username {
         Some(user) if !user.is_empty() => format!("{}@{}", user, server.host),
         _ => server.host.clone(),
@@ -48,8 +56,10 @@ mod tests {
             name: "prod".to_string(),
             description: "production box".to_string(),
             host: "example.com".to_string(),
+            port: None,
             username: None,
             identity_file: None,
+            extra_args: None,
         }
     }
 
@@ -95,6 +105,25 @@ mod tests {
         assert_eq!(
             args(&cmd),
             vec!["-i", "/home/user/.ssh/id_ed25519", "deploy@example.com"]
+        );
+    }
+
+    #[test]
+    fn with_port() {
+        let mut server = base_server();
+        server.port = Some(2222);
+        let cmd = build_command(&server);
+        assert_eq!(args(&cmd), vec!["-p", "2222", "example.com"]);
+    }
+
+    #[test]
+    fn with_extra_args() {
+        let mut server = base_server();
+        server.extra_args = Some("-A -o ServerAliveInterval=30".to_string());
+        let cmd = build_command(&server);
+        assert_eq!(
+            args(&cmd),
+            vec!["-A", "-o", "ServerAliveInterval=30", "example.com"]
         );
     }
 
