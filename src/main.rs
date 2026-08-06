@@ -216,8 +216,9 @@ fn main() -> Result<()> {
         .selected_server()
         .filter(|_| matches!(result, Ok(AppExit::Connect)))
     {
-        let err = ssh::connect(server);
-        eprintln!("failed to exec ssh: {err}");
+        if let Err(err) = ssh::connect(server) {
+            eprintln!("failed to run ssh: {err}");
+        }
     }
 
     match result {

@@ -23,12 +23,20 @@ pub fn build_command(server: &Server) -> Command {
     cmd
 }
 
-/// Replaces the current process with `ssh`, handing full control of the
-/// terminal to it. On success this never returns.
+/// Connects to `server`, handing control of the terminal to `ssh`.
+///
+/// On Unix this replaces the lazyssh process with ssh. On Windows there is no
+/// direct `exec`, so it starts ssh and waits for it to exit.
 #[cfg(unix)]
-pub fn connect(server: &Server) -> std::io::Error {
+pub fn connect(server: &Server) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
-    build_command(server).exec()
+    Err(build_command(server).exec())
+}
+
+#[cfg(not(unix))]
+pub fn connect(server: &Server) -> std::io::Result<()> {
+    let status = build_command(server).status()?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 #[cfg(test)]
