@@ -40,6 +40,16 @@ impl Field {
         }
     }
 
+    /// Label in the bootstrap form, where the target user and key are
+    /// required rather than optional.
+    pub fn bootstrap_label(self) -> &'static str {
+        match self {
+            Field::Username => "Username (required)",
+            Field::IdentityFile => "SSH key path (required)",
+            other => other.label(),
+        }
+    }
+
     pub fn next(self) -> Self {
         let index = Self::ALL.iter().position(|field| *field == self).unwrap();
         Self::ALL[(index + 1).min(Self::ALL.len() - 1)]
@@ -133,6 +143,24 @@ impl DraftServer {
             last_connected_at: None,
         })
     }
+
+    /// Validates the draft for the bootstrap flow, which additionally needs a
+    /// target user and a key whose `.pub` half will be installed remotely.
+    pub fn to_bootstrap_server(&self) -> Result<Server, &'static str> {
+        let server = self.to_server()?;
+        if server.username.is_none() {
+            return Err("Username is required for bootstrap");
+        }
+        if server.identity_file.is_none() {
+            return Err("SSH key path is required for bootstrap");
+        }
+        // The host and user become the `user@host` ssh destination; a
+        // leading '-' would let it be parsed as an ssh option instead.
+        if server.host.starts_with('-') || server.username.as_deref().unwrap().starts_with('-') {
+            return Err("Host and username must not start with '-'");
+        }
+        Ok(server)
+    }
 }
 
 fn optional_trimmed(value: &str) -> Option<String> {
@@ -144,15 +172,25 @@ fn optional_trimmed(value: &str) -> Option<String> {
     }
 }
 
+/// What submitting the form dialog should do with the draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormPurpose {
+    /// Save as a new server entry.
+    Add,
+    /// Replace the server at this index.
+    Edit(usize),
+    /// Exit the TUI and install the public key on the drafted server.
+    Bootstrap,
+}
+
 #[derive(Debug)]
 pub enum Mode {
     Normal,
-    /// The add/edit dialog. `editing` holds the index of the server being
-    /// edited, or `None` when adding a new one.
+    /// The add/edit/bootstrap dialog.
     Form {
         draft: DraftServer,
         field: Field,
-        editing: Option<usize>,
+        purpose: FormPurpose,
     },
     /// The delete confirmation dialog for the selected server.
     ConfirmDelete,
@@ -168,10 +206,13 @@ pub enum StatusKind {
     Info,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppExit {
     Quit,
     Connect,
+    /// Leave the TUI and install this (not yet saved) server's public key on
+    /// the remote host; the user is asked afterwards whether to save it.
+    Bootstrap(Server),
 }
 
 #[derive(Debug)]
@@ -224,7 +265,7 @@ impl App {
         self.mode = Mode::Form {
             draft: DraftServer::default(),
             field: Field::Name,
-            editing: None,
+            purpose: FormPurpose::Add,
         };
         self.status_kind = StatusKind::Hint;
     }
@@ -238,7 +279,16 @@ impl App {
         self.mode = Mode::Form {
             draft,
             field: Field::Name,
-            editing: Some(self.selected),
+            purpose: FormPurpose::Edit(self.selected),
+        };
+        self.status_kind = StatusKind::Hint;
+    }
+
+    pub fn open_bootstrap(&mut self) {
+        self.mode = Mode::Form {
+            draft: DraftServer::default(),
+            field: Field::Name,
+            purpose: FormPurpose::Bootstrap,
         };
         self.status_kind = StatusKind::Hint;
     }
@@ -266,18 +316,44 @@ impl App {
         Ok(())
     }
 
+    /// Submits the form dialog. Add/edit saves to the config and stays in the
+    /// TUI; bootstrap hands the validated draft back so the caller can leave
+    /// the TUI and let `ssh` prompt for the remote password itself.
+    pub fn submit_form(&mut self) -> Result<Option<AppExit>> {
+        let Mode::Form { draft, purpose, .. } = &self.mode else {
+            return Ok(None);
+        };
+
+        if *purpose == FormPurpose::Bootstrap {
+            return match draft.to_bootstrap_server() {
+                Ok(server) => {
+                    self.mode = Mode::Normal;
+                    Ok(Some(AppExit::Bootstrap(server)))
+                }
+                // Keep the dialog open so the input can be corrected.
+                Err(reason) => {
+                    self.set_status(StatusKind::Warn, reason);
+                    Ok(None)
+                }
+            };
+        }
+
+        self.save_draft()?;
+        Ok(None)
+    }
+
     pub fn save_draft(&mut self) -> Result<()> {
-        let Mode::Form { draft, editing, .. } = &self.mode else {
+        let Mode::Form { draft, purpose, .. } = &self.mode else {
             return Ok(());
         };
 
         match draft.to_server() {
             Ok(server) => {
-                let editing = *editing;
+                let purpose = *purpose;
                 let name = server.name.clone();
                 self.mode = Mode::Normal;
-                match editing {
-                    Some(index) if index < self.config.servers.len() => {
+                match purpose {
+                    FormPurpose::Edit(index) if index < self.config.servers.len() => {
                         self.config.update_preserving_recency(index, server);
                         self.selected = index;
                         self.set_status(StatusKind::Success, format!("Updated {name}"));
@@ -326,6 +402,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<AppExit>> {
                 app.request_delete();
                 Ok(None)
             }
+            KeyCode::Char('b' | 'B') => {
+                app.open_bootstrap();
+                Ok(None)
+            }
             KeyCode::Enter => {
                 if app.selected_server().is_some() {
                     Ok(Some(AppExit::Connect))
@@ -344,19 +424,18 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<AppExit>> {
             }
             KeyCode::Enter | KeyCode::Tab => {
                 if field.is_last() {
-                    app.save_draft()?;
+                    app.submit_form()
                 } else {
                     *field = field.next();
+                    Ok(None)
                 }
-                Ok(None)
             }
             KeyCode::BackTab => {
                 *field = field.prev();
                 Ok(None)
             }
             KeyCode::Char('s' | 'S') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.save_draft()?;
-                Ok(None)
+                app.submit_form()
             }
             KeyCode::Backspace => {
                 draft.current_value_mut(*field).pop();
@@ -518,11 +597,110 @@ mod tests {
         let mut app = App::new(config);
 
         app.open_edit();
-        let Mode::Form { draft, editing, .. } = &app.mode else {
+        let Mode::Form { draft, purpose, .. } = &app.mode else {
             panic!("expected form mode");
         };
         assert_eq!(draft.name, "prod");
-        assert_eq!(*editing, Some(0));
+        assert_eq!(*purpose, FormPurpose::Edit(0));
+    }
+
+    #[test]
+    fn bootstrap_draft_requires_username_and_key() {
+        let mut draft = DraftServer {
+            name: "prod".to_string(),
+            host: "example.com".to_string(),
+            ..DraftServer::default()
+        };
+        // Valid as a plain add/edit draft, but not for bootstrap.
+        assert!(draft.to_server().is_ok());
+        assert!(draft.to_bootstrap_server().is_err());
+
+        draft.username = "deploy".to_string();
+        assert!(draft.to_bootstrap_server().is_err());
+
+        draft.identity_file = "~/.ssh/id_ed25519".to_string();
+        let server = draft.to_bootstrap_server().unwrap();
+        assert_eq!(server.username.as_deref(), Some("deploy"));
+        assert_eq!(server.identity_file.as_deref(), Some("~/.ssh/id_ed25519"));
+    }
+
+    #[test]
+    fn bootstrap_draft_rejects_option_like_host_and_user() {
+        for (host, user) in [("-oProxyCommand=x", "deploy"), ("example.com", "-fake")] {
+            let draft = DraftServer {
+                name: "prod".to_string(),
+                host: host.to_string(),
+                username: user.to_string(),
+                identity_file: "~/.ssh/id_ed25519".to_string(),
+                ..DraftServer::default()
+            };
+            assert!(
+                draft.to_bootstrap_server().is_err(),
+                "host {host:?} user {user:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn b_key_opens_bootstrap_form() {
+        let mut app = App::new(Config::default());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('b'))).unwrap();
+        let Mode::Form { purpose, .. } = &app.mode else {
+            panic!("expected form mode");
+        };
+        assert_eq!(*purpose, FormPurpose::Bootstrap);
+    }
+
+    #[test]
+    fn submitting_bootstrap_form_exits_without_saving() {
+        let mut app = App::new(Config::default());
+        app.open_bootstrap();
+        if let Mode::Form { draft, .. } = &mut app.mode {
+            draft.name = "new-box".to_string();
+            draft.host = "10.0.0.9".to_string();
+            draft.username = "deploy".to_string();
+            draft.identity_file = "~/.ssh/id_ed25519".to_string();
+        }
+
+        let exit = app.submit_form().unwrap();
+        let Some(AppExit::Bootstrap(server)) = exit else {
+            panic!("expected bootstrap exit, got {exit:?}");
+        };
+        assert_eq!(server.name, "new-box");
+        assert_eq!(server.username.as_deref(), Some("deploy"));
+        // The entry is only saved after the user confirms outside the TUI.
+        assert!(app.config.servers.is_empty());
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn invalid_bootstrap_submit_keeps_the_form_open() {
+        let mut app = App::new(Config::default());
+        app.open_bootstrap();
+        if let Mode::Form { draft, .. } = &mut app.mode {
+            draft.name = "new-box".to_string();
+            draft.host = "10.0.0.9".to_string();
+        }
+
+        assert_eq!(app.submit_form().unwrap(), None);
+        assert!(matches!(
+            app.mode,
+            Mode::Form {
+                purpose: FormPurpose::Bootstrap,
+                ..
+            }
+        ));
+        assert_eq!(app.status_kind, StatusKind::Warn);
+    }
+
+    #[test]
+    fn bootstrap_labels_mark_user_and_key_required() {
+        assert_eq!(Field::Username.bootstrap_label(), "Username (required)");
+        assert_eq!(
+            Field::IdentityFile.bootstrap_label(),
+            "SSH key path (required)"
+        );
+        assert_eq!(Field::Name.bootstrap_label(), Field::Name.label());
     }
 
     #[test]

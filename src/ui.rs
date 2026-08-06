@@ -10,7 +10,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, DraftServer, Field, Mode, StatusKind};
+use crate::app::{App, DraftServer, Field, FormPurpose, Mode, StatusKind};
 use crate::config::Server;
 use crate::theme::{theme, Theme};
 
@@ -59,10 +59,18 @@ const NORMAL_HELP: &[(&str, &str)] = &[
     ("A", "Add"),
     ("E", "Edit"),
     ("D", "Delete"),
+    ("B", "Bootstrap"),
     ("Enter", "Connect"),
     ("Q", "Quit"),
 ];
-const NORMAL_HELP_SHORT: &[(&str, &str)] = &[("A", ""), ("E", ""), ("D", ""), ("↵", ""), ("Q", "")];
+const NORMAL_HELP_SHORT: &[(&str, &str)] = &[
+    ("A", ""),
+    ("E", ""),
+    ("D", ""),
+    ("B", ""),
+    ("↵", ""),
+    ("Q", ""),
+];
 
 const FORM_HELP: &[(&str, &str)] = &[
     ("Enter/Tab", "Next"),
@@ -98,8 +106,8 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::Form {
             draft,
             field,
-            editing,
-        } => render_form_popup(frame, app, draft, *field, editing.is_some(), t),
+            purpose,
+        } => render_form_popup(frame, app, draft, *field, *purpose, t),
         Mode::ConfirmDelete => render_confirm_popup(frame, app, t),
         Mode::Normal => {}
     }
@@ -431,7 +439,8 @@ fn render_main(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let width = card_width(area.width).min(area.width);
     let height = card_height(rows, empty).min(area.height);
 
-    let full_desc_h = match app.selected_server() {
+    let show_inspector = matches!(app.mode, Mode::Normal);
+    let full_desc_h = match app.selected_server().filter(|_| show_inspector) {
         Some(server) => {
             let lines =
                 description_lines(&server.description, desc_text_width(width), DESC_MAX_LINES);
@@ -876,7 +885,7 @@ fn render_form_popup(
     app: &App,
     draft: &DraftServer,
     active: Field,
-    editing: bool,
+    purpose: FormPurpose,
     t: &Theme,
 ) {
     let width = frame.area().width.saturating_sub(4).min(72);
@@ -891,10 +900,10 @@ fn render_form_popup(
     let area = centered_fixed(width, height, frame.area());
     frame.render_widget(Clear, area);
 
-    let (icon, title) = if editing {
-        (" ✎ ", "EDIT SERVER ")
-    } else {
-        (" ✚ ", "ADD SERVER ")
+    let (icon, title) = match purpose {
+        FormPurpose::Add => (" ✚ ", "ADD SERVER "),
+        FormPurpose::Edit(_) => (" ✎ ", "EDIT SERVER "),
+        FormPurpose::Bootstrap => (" ⚙ ", "BOOTSTRAP SERVER "),
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -936,9 +945,14 @@ fn render_form_popup(
                 } else {
                     label_style
                 };
+                let label = if purpose == FormPurpose::Bootstrap {
+                    field.bootstrap_label()
+                } else {
+                    field.label()
+                };
                 vec![
                     Span::styled(format!("{marker} "), marker_style),
-                    Span::styled(format!("{:<26}", field.label()), label_style),
+                    Span::styled(format!("{:<26}", label), label_style),
                 ]
             } else {
                 vec![Span::raw(" ".repeat(FORM_LABEL_COL))]
@@ -1435,6 +1449,29 @@ mod tests {
                 terminal.draw(|f| render(f, app)).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn bootstrap_form_marks_user_and_key_required() {
+        let mut app = sample_app(0);
+        app.open_bootstrap();
+
+        let backend = TestBackend::new(100, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("BOOTSTRAP SERVER"));
+        assert!(text.contains("Username (required)"));
+        assert!(text.contains("SSH key path (required)"));
+    }
+
+    #[test]
+    fn normal_footer_advertises_bootstrap() {
+        let app = sample_app(1);
+        let backend = TestBackend::new(100, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        assert!(buffer_text(&terminal).contains("Bootstrap"));
     }
 
     #[test]
