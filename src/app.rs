@@ -2,7 +2,7 @@
 //! persistence in [`crate::config`]; the ssh handoff in [`crate::ssh`].
 
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::config::{Config, Server};
 
@@ -375,6 +375,10 @@ impl App {
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<AppExit>> {
+    if key.kind == KeyEventKind::Release {
+        return Ok(None);
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(Some(AppExit::Quit));
     }
@@ -649,6 +653,54 @@ mod tests {
             panic!("expected form mode");
         };
         assert_eq!(*purpose, FormPurpose::Bootstrap);
+    }
+
+    #[test]
+    fn key_release_events_are_ignored() {
+        let mut app = App::new(Config::default());
+        app.open_add();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new_with_kind(KeyCode::Char('p'), KeyModifiers::NONE, KeyEventKind::Press),
+        )
+        .unwrap();
+        handle_key(
+            &mut app,
+            KeyEvent::new_with_kind(
+                KeyCode::Char('p'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ),
+        )
+        .unwrap();
+
+        let Mode::Form { draft, .. } = &app.mode else {
+            panic!("expected form mode");
+        };
+        assert_eq!(draft.name, "p");
+    }
+
+    #[test]
+    fn key_repeat_events_still_apply() {
+        let mut app = App::new(Config::default());
+        app.open_add();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new_with_kind(KeyCode::Char('p'), KeyModifiers::NONE, KeyEventKind::Press),
+        )
+        .unwrap();
+        handle_key(
+            &mut app,
+            KeyEvent::new_with_kind(KeyCode::Char('p'), KeyModifiers::NONE, KeyEventKind::Repeat),
+        )
+        .unwrap();
+
+        let Mode::Form { draft, .. } = &app.mode else {
+            panic!("expected form mode");
+        };
+        assert_eq!(draft.name, "pp");
     }
 
     #[test]
