@@ -11,7 +11,7 @@ use ratatui::{
 };
 
 use crate::app::{App, DraftServer, Field, FormPurpose, Mode, StatusKind};
-use crate::config::Server;
+use crate::config::{Server, SshLauncher};
 use crate::theme::{theme, Theme};
 
 /// Terminal width at which the dashboard switches from a compact single-line
@@ -60,6 +60,7 @@ const NORMAL_HELP: &[(&str, &str)] = &[
     ("E", "Edit"),
     ("D", "Delete"),
     ("B", "Bootstrap"),
+    ("S", "Settings"),
     ("Enter", "Connect"),
     ("Q", "Quit"),
 ];
@@ -68,6 +69,7 @@ const NORMAL_HELP_SHORT: &[(&str, &str)] = &[
     ("E", ""),
     ("D", ""),
     ("B", ""),
+    ("S", ""),
     ("↵", ""),
     ("Q", ""),
 ];
@@ -81,6 +83,14 @@ const FORM_HELP: &[(&str, &str)] = &[
 const FORM_HELP_SHORT: &[(&str, &str)] = &[("Ctrl+S", "Save"), ("Esc", "Cancel")];
 
 const CONFIRM_HELP: &[(&str, &str)] = &[("Y", "Delete"), ("N", "Cancel")];
+
+const SETTINGS_HELP: &[(&str, &str)] = &[("j/k", "Move"), ("Enter", "Save"), ("Esc", "Cancel")];
+const SETTINGS_HELP_SHORT: &[(&str, &str)] = &[("↵", "Save"), ("Esc", "Cancel")];
+
+/// Separator between key badges, and the tight variant used when the roomy
+/// one would push the command bar past the terminal edge.
+const HINT_SEP: &str = "  │  ";
+const HINT_SEP_TIGHT: &str = " │ ";
 
 pub fn render(frame: &mut Frame, app: &App) {
     let t = theme();
@@ -109,6 +119,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             purpose,
         } => render_form_popup(frame, app, draft, *field, *purpose, t),
         Mode::ConfirmDelete => render_confirm_popup(frame, app, t),
+        Mode::Settings { launcher } => render_settings_popup(frame, *launcher, t),
         Mode::Normal => {}
     }
 }
@@ -137,10 +148,16 @@ fn cursor_visible(tick: u64) -> bool {
 /// for the footer command bar and the popup headers. The Enter/↵ key cap is
 /// filled with the green accent since connecting is the primary action.
 fn hint_line(pairs: &[(&str, &str)], t: &Theme) -> Line<'static> {
+    hint_line_with(pairs, HINT_SEP, t)
+}
+
+/// [`hint_line`] with an explicit separator, so the footer can tighten the
+/// spacing before it starts dropping labels.
+fn hint_line_with(pairs: &[(&str, &str)], sep: &str, t: &Theme) -> Line<'static> {
     let mut spans = Vec::new();
     for (i, (key, desc)) in pairs.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled("  │  ", Style::default().fg(t.border)));
+            spans.push(Span::styled(sep.to_string(), Style::default().fg(t.border)));
         }
         let key_style = if *key == "Enter" || *key == "↵" {
             Style::default()
@@ -741,6 +758,7 @@ fn help_for(mode: &Mode) -> &'static [(&'static str, &'static str)] {
         Mode::Normal => NORMAL_HELP,
         Mode::Form { .. } => FORM_HELP,
         Mode::ConfirmDelete => CONFIRM_HELP,
+        Mode::Settings { .. } => SETTINGS_HELP,
     }
 }
 
@@ -749,7 +767,32 @@ fn short_help_for(mode: &Mode) -> &'static [(&'static str, &'static str)] {
         Mode::Normal => NORMAL_HELP_SHORT,
         Mode::Form { .. } => FORM_HELP_SHORT,
         Mode::ConfirmDelete => CONFIRM_HELP,
+        Mode::Settings { .. } => SETTINGS_HELP_SHORT,
     }
+}
+
+/// Whether a hint line fits the command bar in `area_width`, leaving room for
+/// the bar's borders and padding.
+fn hint_fits(line: &Line<'static>, area_width: u16) -> bool {
+    (line.width() as u16).saturating_add(4) <= area_width
+}
+
+/// The widest hint line that fits `area_width`: the full badge set first,
+/// then the same set with tighter separators, and only then the key caps on
+/// their own. Labels are worth more than whitespace when space runs out.
+fn footer_hint(mode: &Mode, area_width: u16, t: &Theme) -> Line<'static> {
+    let candidates = [
+        (help_for(mode), HINT_SEP),
+        (help_for(mode), HINT_SEP_TIGHT),
+        (short_help_for(mode), HINT_SEP),
+    ];
+    for (pairs, sep) in candidates {
+        let line = hint_line_with(pairs, sep, t);
+        if hint_fits(&line, area_width) {
+            return line;
+        }
+    }
+    hint_line_with(short_help_for(mode), HINT_SEP_TIGHT, t)
 }
 
 /// The bottom command bar: a centered, bordered box holding either the
@@ -757,14 +800,7 @@ fn short_help_for(mode: &Mode) -> &'static [(&'static str, &'static str)] {
 /// shortened badge set when the terminal is too narrow for the full one.
 fn render_footer(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let line = match app.status_kind {
-        StatusKind::Hint => {
-            let full = hint_line(help_for(&app.mode), t);
-            if (full.width() as u16).saturating_add(4) > area.width {
-                hint_line(short_help_for(&app.mode), t)
-            } else {
-                full
-            }
-        }
+        StatusKind::Hint => footer_hint(&app.mode, area.width, t),
         StatusKind::Success => Line::from(vec![
             Span::styled("✓ ", Style::default().fg(t.green)),
             Span::styled(app.status.clone(), Style::default().fg(t.green)),
@@ -1032,11 +1068,182 @@ fn render_confirm_popup(frame: &mut Frame, app: &App, t: &Theme) {
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
 }
 
+/// Columns before a launcher label: the `❯ ` selection marker.
+const SETTINGS_MARKER_WIDTH: usize = 2;
+/// Column width reserved for a launcher label before its description.
+const SETTINGS_LABEL_WIDTH: usize = 10;
+/// Columns the settings modal adds around its content: borders and padding.
+const SETTINGS_CHROME_WIDTH: u16 = 6;
+/// Rows the settings modal adds around its content: borders and padding.
+const SETTINGS_CHROME_HEIGHT: u16 = 4;
+/// Most rows of wrapped description text under a choice, once the modal is
+/// too narrow to keep descriptions on the label row.
+const SETTINGS_DESC_MAX_LINES: usize = 2;
+
+/// Longest launcher description, in characters. Drives the modal width so
+/// every choice can explain itself on one row when the terminal allows.
+fn longest_launcher_description() -> usize {
+    SshLauncher::ALL
+        .iter()
+        .map(|launcher| launcher.description().chars().count())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Width of the settings modal: wide enough for the longest description
+/// beside its label, minus whatever the terminal cannot give.
+fn settings_popup_width(area_width: u16) -> u16 {
+    let content = SETTINGS_MARKER_WIDTH + SETTINGS_LABEL_WIDTH + longest_launcher_description();
+    (content as u16)
+        .saturating_add(SETTINGS_CHROME_WIDTH)
+        .min(area_width.saturating_sub(4))
+}
+
+/// Whether `inner_width` fits every description on its label's row. Narrow
+/// modals wrap the description underneath instead of truncating it.
+fn settings_inline_descriptions(inner_width: u16) -> bool {
+    (inner_width as usize)
+        >= SETTINGS_MARKER_WIDTH + SETTINGS_LABEL_WIDTH + longest_launcher_description()
+}
+
+/// Pads `spans` out to `width` so the highlight tints the whole row.
+fn settings_row(
+    mut spans: Vec<Span<'static>>,
+    used: usize,
+    width: usize,
+    active: bool,
+    t: &Theme,
+) -> Line<'static> {
+    spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+    let line = Line::from(spans);
+    if active {
+        line.style(Style::default().bg(t.selected_bg))
+    } else {
+        line
+    }
+}
+
+/// Body of the settings modal at `inner_width`: the key hints, then one
+/// highlighted block per launcher choice. `draft` is the highlighted choice,
+/// which is not yet the saved preference.
+fn settings_lines(draft: SshLauncher, inner_width: u16, t: &Theme) -> Vec<Line<'static>> {
+    let full_hint = hint_line(SETTINGS_HELP, t);
+    let hint = if full_hint.width() > inner_width as usize {
+        hint_line(SETTINGS_HELP_SHORT, t)
+    } else {
+        full_hint
+    };
+    let mut lines = vec![hint, Line::raw("")];
+
+    let width = inner_width as usize;
+    let inline = settings_inline_descriptions(inner_width);
+
+    for (i, launcher) in SshLauncher::ALL.into_iter().enumerate() {
+        let active = launcher == draft;
+        let (marker, marker_style, label_style) = if active {
+            (
+                "❯ ",
+                Style::default().fg(t.green).add_modifier(Modifier::BOLD),
+                Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (
+                "  ",
+                Style::default().fg(t.muted),
+                Style::default().fg(t.text),
+            )
+        };
+        let desc_style = Style::default().fg(if active { t.muted_primary } else { t.muted });
+
+        if inline {
+            let desc = launcher.description();
+            let spans = vec![
+                Span::styled(marker, marker_style),
+                Span::styled(
+                    format!("{:<SETTINGS_LABEL_WIDTH$}", launcher.label()),
+                    label_style,
+                ),
+                Span::styled(desc.to_string(), desc_style),
+            ];
+            let used = SETTINGS_MARKER_WIDTH + SETTINGS_LABEL_WIDTH + desc.chars().count();
+            lines.push(settings_row(spans, used, width, active, t));
+            continue;
+        }
+
+        let label = launcher.label();
+        lines.push(settings_row(
+            vec![
+                Span::styled(marker, marker_style),
+                Span::styled(label.to_string(), label_style),
+            ],
+            SETTINGS_MARKER_WIDTH + label.chars().count(),
+            width,
+            active,
+            t,
+        ));
+
+        let indent = SETTINGS_MARKER_WIDTH + 2;
+        let desc_width = width.saturating_sub(indent).max(1);
+        for chunk in description_lines(launcher.description(), desc_width, SETTINGS_DESC_MAX_LINES)
+        {
+            let used = indent + chunk.chars().count();
+            lines.push(settings_row(
+                vec![
+                    Span::raw(" ".repeat(indent)),
+                    Span::styled(chunk, desc_style),
+                ],
+                used,
+                width,
+                active,
+                t,
+            ));
+        }
+        if i + 1 < SshLauncher::ALL.len() {
+            lines.push(Line::raw(""));
+        }
+    }
+
+    lines
+}
+
+/// The settings modal: the SSH launcher choices, with the draft highlighted.
+/// Sized from its own content and clamped to the terminal, so it degrades to
+/// a clipped box on tiny screens rather than overflowing.
+fn render_settings_popup(frame: &mut Frame, draft: SshLauncher, t: &Theme) {
+    let width = settings_popup_width(frame.area().width);
+    let inner_width = width.saturating_sub(SETTINGS_CHROME_WIDTH);
+    let lines = settings_lines(draft, inner_width, t);
+    let height = (lines.len() as u16).saturating_add(SETTINGS_CHROME_HEIGHT);
+    let area = centered_fixed(width, height, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t.primary))
+        .style(Style::default().bg(t.panel_bg))
+        .padding(Padding::new(2, 2, 1, 1))
+        .title(Line::from(vec![
+            Span::styled(" ⚙ ", Style::default().fg(t.green)),
+            Span::styled(
+                "SSH LAUNCHER ",
+                Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::App;
-    use crate::config::{Config, Server};
+    use crate::config::{Config, Server, SshLauncher};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -1472,6 +1679,151 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(f, &app)).unwrap();
         assert!(buffer_text(&terminal).contains("Bootstrap"));
+    }
+
+    #[test]
+    fn normal_footer_advertises_settings() {
+        let app = sample_app(1);
+        let backend = TestBackend::new(100, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Settings"), "{text}");
+        // The tighter separators must not cost any other label either.
+        assert!(text.contains("Bootstrap"), "{text}");
+    }
+
+    #[test]
+    fn footer_hint_tightens_separators_before_dropping_labels() {
+        let t = &Theme::TRUECOLOR;
+        let full = hint_line(NORMAL_HELP, t);
+        let tight = hint_line_with(NORMAL_HELP, HINT_SEP_TIGHT, t);
+        let short = hint_line_with(NORMAL_HELP_SHORT, HINT_SEP, t);
+        assert!(tight.width() < full.width());
+
+        let width = |w: u16| footer_hint(&Mode::Normal, w, t).width();
+        // Room for everything.
+        assert_eq!(width(full.width() as u16 + 4), full.width());
+        // One column short: labels survive, the spacing gives way first.
+        assert_eq!(width(full.width() as u16 + 3), tight.width());
+        // Too narrow for any labelled set: key caps only.
+        assert_eq!(width(short.width() as u16 + 4), short.width());
+        assert_eq!(
+            width(0),
+            hint_line_with(NORMAL_HELP_SHORT, HINT_SEP_TIGHT, t).width()
+        );
+    }
+
+    #[test]
+    fn settings_popup_lists_every_launcher_with_its_description() {
+        let mut app = sample_app(2);
+        app.open_settings();
+
+        let backend = TestBackend::new(100, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+
+        assert!(text.contains("SSH LAUNCHER"), "{text}");
+        for launcher in SshLauncher::ALL {
+            assert!(
+                text.contains(launcher.label()),
+                "{}: {text}",
+                launcher.label()
+            );
+            // A wide terminal keeps each description on its label's row.
+            assert!(
+                text.contains(launcher.description()),
+                "{}: {text}",
+                launcher.label()
+            );
+        }
+    }
+
+    #[test]
+    fn settings_popup_marks_the_draft_choice() {
+        let mut app = sample_app(1);
+        app.open_settings();
+        if let Mode::Settings { launcher } = &mut app.mode {
+            *launcher = SshLauncher::Kitty;
+        }
+
+        let backend = TestBackend::new(100, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+
+        assert!(text.lines().any(|line| line.contains("❯ Kitty")), "{text}");
+        assert!(!text.lines().any(|line| line.contains("❯ Auto")), "{text}");
+        assert!(
+            !text.lines().any(|line| line.contains("❯ OpenSSH")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn settings_popup_stacks_descriptions_when_narrow() {
+        let mut app = sample_app(1);
+        app.open_settings();
+
+        // Too narrow to keep descriptions beside their labels, so they wrap
+        // underneath instead of vanishing.
+        let backend = TestBackend::new(50, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+
+        assert!(!settings_inline_descriptions(
+            settings_popup_width(50).saturating_sub(SETTINGS_CHROME_WIDTH)
+        ));
+        for launcher in SshLauncher::ALL {
+            assert!(
+                text.contains(launcher.label()),
+                "{}: {text}",
+                launcher.label()
+            );
+        }
+        assert!(text.contains("Always run"), "{text}");
+        let label_row = text.lines().find(|line| line.contains("Kitty ")).unwrap();
+        assert!(!label_row.contains("kitten ssh"), "{text}");
+    }
+
+    #[test]
+    fn settings_popup_width_shrinks_with_the_terminal() {
+        let content =
+            (SETTINGS_MARKER_WIDTH + SETTINGS_LABEL_WIDTH + longest_launcher_description()) as u16;
+        let full = content + SETTINGS_CHROME_WIDTH;
+        assert_eq!(settings_popup_width(200), full);
+        assert_eq!(settings_popup_width(full + 4), full);
+        assert_eq!(settings_popup_width(30), 26);
+        assert_eq!(settings_popup_width(4), 0);
+        assert_eq!(settings_popup_width(0), 0);
+    }
+
+    #[test]
+    fn settings_popup_renders_at_any_size() {
+        let mut app = sample_app(3);
+        app.open_settings();
+        for draft in SshLauncher::ALL {
+            if let Mode::Settings { launcher } = &mut app.mode {
+                *launcher = draft;
+            }
+            for (w, h) in [
+                (120, 40),
+                (84, 24),
+                (60, 18),
+                (40, 12),
+                (20, 8),
+                (10, 5),
+                (5, 3),
+                (3, 2),
+                (1, 1),
+            ] {
+                let backend = TestBackend::new(w, h);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal.draw(|f| render(f, &app)).unwrap();
+            }
+        }
     }
 
     #[test]

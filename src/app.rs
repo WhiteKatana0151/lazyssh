@@ -4,7 +4,7 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::config::{Config, Server};
+use crate::config::{Config, Server, SshLauncher};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -194,6 +194,12 @@ pub enum Mode {
     },
     /// The delete confirmation dialog for the selected server.
     ConfirmDelete,
+    /// The settings dialog. `launcher` is a draft: it follows the highlighted
+    /// choice and only reaches the config when the dialog is confirmed, so
+    /// cancelling leaves the saved preference untouched.
+    Settings {
+        launcher: SshLauncher,
+    },
 }
 
 /// How a status message should be rendered: `Hint` shows the contextual
@@ -291,6 +297,37 @@ impl App {
             purpose: FormPurpose::Bootstrap,
         };
         self.status_kind = StatusKind::Hint;
+    }
+
+    /// Opens the settings dialog with the saved preference highlighted.
+    pub fn open_settings(&mut self) {
+        self.mode = Mode::Settings {
+            launcher: self.config.launcher,
+        };
+        self.status_kind = StatusKind::Hint;
+    }
+
+    /// Stores `launcher` as the preference and closes the dialog, reporting
+    /// whether the saved value actually changed. Persistence is the caller's
+    /// job so the state change stays independent of touching disk.
+    fn set_launcher(&mut self, launcher: SshLauncher) -> bool {
+        let changed = self.config.launcher != launcher;
+        self.config.launcher = launcher;
+        self.mode = Mode::Normal;
+        self.set_status(
+            StatusKind::Success,
+            format!("Launcher set to {}", launcher.label()),
+        );
+        changed
+    }
+
+    /// Confirms the settings dialog: keeps `launcher` and writes it out. An
+    /// unchanged choice closes the dialog without rewriting the config.
+    pub fn commit_settings(&mut self, launcher: SshLauncher) -> Result<()> {
+        if self.set_launcher(launcher) {
+            self.config.save()?;
+        }
+        Ok(())
     }
 
     pub fn request_delete(&mut self) {
@@ -410,6 +447,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<AppExit>> {
                 app.open_bootstrap();
                 Ok(None)
             }
+            KeyCode::Char('s' | 'S') => {
+                app.open_settings();
+                Ok(None)
+            }
             KeyCode::Enter => {
                 if app.selected_server().is_some() {
                     Ok(Some(AppExit::Connect))
@@ -447,6 +488,27 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<AppExit>> {
             }
             KeyCode::Char(c) => {
                 draft.current_value_mut(*field).push(c);
+                Ok(None)
+            }
+            _ => Ok(None),
+        },
+        Mode::Settings { launcher } => match key.code {
+            KeyCode::Char('j' | 'J') | KeyCode::Down | KeyCode::Tab => {
+                *launcher = launcher.next();
+                Ok(None)
+            }
+            KeyCode::Char('k' | 'K') | KeyCode::Up | KeyCode::BackTab => {
+                *launcher = launcher.prev();
+                Ok(None)
+            }
+            KeyCode::Enter => {
+                let chosen = *launcher;
+                app.commit_settings(chosen)?;
+                Ok(None)
+            }
+            KeyCode::Esc => {
+                app.mode = Mode::Normal;
+                app.set_status(StatusKind::Info, "Cancelled");
                 Ok(None)
             }
             _ => Ok(None),
@@ -753,6 +815,81 @@ mod tests {
             "SSH key path (required)"
         );
         assert_eq!(Field::Name.bootstrap_label(), Field::Name.label());
+    }
+
+    #[test]
+    fn settings_open_with_saved_launcher_and_cancel_without_mutating_config() {
+        let config = Config {
+            launcher: SshLauncher::OpenSsh,
+            ..Config::default()
+        };
+        let mut app = App::new(config);
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('s'))).unwrap();
+        assert!(matches!(
+            app.mode,
+            Mode::Settings {
+                launcher: SshLauncher::OpenSsh
+            }
+        ));
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Down)).unwrap();
+        assert!(matches!(
+            app.mode,
+            Mode::Settings {
+                launcher: SshLauncher::Kitty
+            }
+        ));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc)).unwrap();
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.config.launcher, SshLauncher::OpenSsh);
+    }
+
+    #[test]
+    fn settings_navigation_clamps_at_both_ends() {
+        let mut app = App::new(Config::default());
+        app.open_settings();
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Up)).unwrap();
+        assert!(matches!(
+            app.mode,
+            Mode::Settings {
+                launcher: SshLauncher::Auto
+            }
+        ));
+
+        for _ in 0..3 {
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char('j'))).unwrap();
+        }
+        assert!(matches!(
+            app.mode,
+            Mode::Settings {
+                launcher: SshLauncher::Kitty
+            }
+        ));
+    }
+
+    #[test]
+    fn confirming_settings_updates_in_memory_preference_and_closes() {
+        let mut app = App::new(Config::default());
+        app.open_settings();
+
+        assert!(app.set_launcher(SshLauncher::Kitty));
+        assert_eq!(app.config.launcher, SshLauncher::Kitty);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.status_kind, StatusKind::Success);
+    }
+
+    #[test]
+    fn enter_confirms_unchanged_settings_without_touching_disk() {
+        let mut app = App::new(Config::default());
+        app.open_settings();
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        assert_eq!(app.config.launcher, SshLauncher::Auto);
+        assert!(matches!(app.mode, Mode::Normal));
     }
 
     #[test]

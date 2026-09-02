@@ -39,18 +39,25 @@ fn main() -> Result<()> {
 
     match &result {
         Ok(AppExit::Connect) if app.selected_server().is_some() => {
-            // Record the connection before handing off: on Unix `connect`
-            // execs and never returns. A failed save shouldn't block the
-            // connection.
-            app.config
-                .mark_connected(app.selected, config::now_unix_secs());
-            if let Err(err) = app.config.save() {
-                eprintln!("warning: failed to save connection history: {err}");
-            }
-            if let Some(server) = app.selected_server() {
-                if let Err(err) = ssh::connect(server) {
-                    eprintln!("failed to run ssh: {err}");
+            // Resolve before recording recency: a forced Kitty launcher that
+            // is not installed is a configuration error, not a connection.
+            let preference = app.config.launcher;
+            match ssh::resolve_launcher_from_env(preference) {
+                Ok(launcher) => {
+                    // Record before handing off: on Unix `connect` execs and
+                    // never returns. A failed save should not block SSH.
+                    app.config
+                        .mark_connected(app.selected, config::now_unix_secs());
+                    if let Err(err) = app.config.save() {
+                        eprintln!("warning: failed to save connection history: {err}");
+                    }
+                    if let Some(server) = app.selected_server() {
+                        if let Err(err) = ssh::connect(server, launcher) {
+                            eprintln!("failed to run ssh: {err}");
+                        }
+                    }
                 }
+                Err(err) => eprintln!("cannot connect: {err}"),
             }
         }
         Ok(AppExit::Bootstrap(server)) => {

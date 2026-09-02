@@ -13,7 +13,7 @@ It stores only connection metadata and SSH key paths. It does not store password
 - List saved SSH servers by name in a centered card with airy rows, a full-width selection bar, and a status dot per row.
 - Add a server from the TUI.
 - Delete a server.
-- Connect to a selected server by launching `ssh`.
+- Connect through native OpenSSH or Kitty's SSH kitten, selected safely and configured from the TUI.
 - Persist entries at:
 
 ```text
@@ -56,9 +56,29 @@ k / Up       move up
 a            add server
 e            edit selected server (coming soon)
 d            delete selected server
+s            SSH launcher settings
 Enter        connect to selected server
 q / Esc      quit
 ```
+
+SSH launcher settings:
+
+```text
+j / Down         next launcher
+k / Up           previous launcher
+Enter            save selection
+Esc              cancel without saving
+```
+
+## SSH launcher modes
+
+Open the settings dialog with `s`. LazySSH persists the selected mode alongside the server list, so no manual configuration-file editing is required.
+
+- **Auto** (default): when `TERM=xterm-kitty` and `kitten` is available, LazySSH launches `kitten ssh`. If only the `kitty` executable is available, it uses `kitty +kitten ssh`. When `TERM` is unavailable, a Kitty window ID can provide the same signal. An explicit non-Kitty `TERM`—including `tmux-*`—safely falls back to native `ssh`; users with correctly configured multiplexer passthrough can force Kitty mode.
+- **OpenSSH**: always launch native `ssh`.
+- **Kitty**: always use Kitty's SSH kitten. If neither `kitten` nor `kitty` is available, LazySSH reports the configuration error instead of silently falling back.
+
+Kitty advertises `TERM=xterm-kitty`. Servers without that terminfo entry can make commands such as `clear`, `vim`, `less`, or `tmux` misbehave. Kitty's SSH kitten transfers the required terminal information for the session, avoiding manual terminfo installation across every remote server. LazySSH never rewrites `TERM`, and SSH key bootstrap continues to use native OpenSSH.
 
 Add server popup:
 
@@ -89,7 +109,8 @@ Example saved entry:
       "username": "sam",
       "identity_file": "/home/viper/.ssh/id_ed25519"
     }
-  ]
+  ],
+  "launcher": "auto"
 }
 ```
 
