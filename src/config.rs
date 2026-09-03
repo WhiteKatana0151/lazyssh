@@ -33,9 +33,70 @@ pub fn now_unix_secs() -> u64 {
         .unwrap_or_default()
 }
 
+/// Which program takes over the terminal when connecting interactively.
+///
+/// `Auto` is the safe default: it only reaches for Kitty when the app is
+/// actually running inside Kitty *and* a Kitty launcher exists, otherwise it
+/// falls back to plain OpenSSH.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SshLauncher {
+    #[default]
+    Auto,
+    #[serde(rename = "openssh")]
+    OpenSsh,
+    Kitty,
+}
+
+impl SshLauncher {
+    pub const ALL: [SshLauncher; 3] = [SshLauncher::Auto, SshLauncher::OpenSsh, SshLauncher::Kitty];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SshLauncher::Auto => "Auto",
+            SshLauncher::OpenSsh => "OpenSSH",
+            SshLauncher::Kitty => "Kitty",
+        }
+    }
+
+    /// One-line explanation shown next to each choice in the settings modal.
+    pub fn description(self) -> &'static str {
+        match self {
+            SshLauncher::Auto => "Use Kitty when running in Kitty, else OpenSSH",
+            SshLauncher::OpenSsh => "Always run plain `ssh`",
+            SshLauncher::Kitty => "Always run `kitten ssh` (needs Kitty installed)",
+        }
+    }
+
+    /// Index of this variant in [`SshLauncher::ALL`], used by the settings
+    /// modal to drive keyboard navigation.
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|l| *l == self).unwrap_or(0)
+    }
+
+    pub fn from_index(index: usize) -> Self {
+        Self::ALL.get(index).copied().unwrap_or_default()
+    }
+
+    /// The next choice in [`SshLauncher::ALL`], clamped at the end like the
+    /// rest of the app's list navigation.
+    pub fn next(self) -> Self {
+        Self::from_index((self.index() + 1).min(Self::ALL.len() - 1))
+    }
+
+    /// The previous choice, clamped at the start.
+    pub fn prev(self) -> Self {
+        Self::from_index(self.index().saturating_sub(1))
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub servers: Vec<Server>,
+    /// `serde(default)` keeps configs written before this field existed
+    /// loading, as [`SshLauncher::Auto`].
+    #[serde(default)]
+    pub launcher: SshLauncher,
 }
 
 impl Config {
@@ -197,6 +258,49 @@ mod tests {
         assert_eq!(loaded.servers[0].port, None);
         assert_eq!(loaded.servers[0].extra_args, None);
         assert_eq!(loaded.servers[0].last_connected_at, None);
+    }
+
+    #[test]
+    fn launcher_defaults_to_auto() {
+        assert_eq!(Config::default().launcher, SshLauncher::Auto);
+        assert_eq!(SshLauncher::default(), SshLauncher::Auto);
+    }
+
+    #[test]
+    fn old_configs_without_a_launcher_load_as_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("servers.json");
+        fs::write(
+            &path,
+            r#"{"servers":[{"name":"box1","description":"","host":"example.com","username":null,"identity_file":null}]}"#,
+        )
+        .unwrap();
+
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.launcher, SshLauncher::Auto);
+    }
+
+    #[test]
+    fn launcher_round_trips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("servers.json");
+
+        for launcher in [SshLauncher::Auto, SshLauncher::OpenSsh, SshLauncher::Kitty] {
+            let config = Config {
+                servers: vec![sample_server("box1")],
+                launcher,
+            };
+            config.save_to(&path).unwrap();
+            assert_eq!(Config::load_from(&path).unwrap(), config);
+        }
+    }
+
+    #[test]
+    fn launcher_labels_are_stable() {
+        assert_eq!(SshLauncher::ALL.len(), 3);
+        assert_eq!(SshLauncher::Auto.label(), "Auto");
+        assert_eq!(SshLauncher::OpenSsh.label(), "OpenSSH");
+        assert_eq!(SshLauncher::Kitty.label(), "Kitty");
     }
 
     #[test]
