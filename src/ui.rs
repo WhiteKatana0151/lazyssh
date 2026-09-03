@@ -1207,8 +1207,9 @@ fn settings_lines(draft: SshLauncher, inner_width: u16, t: &Theme) -> Vec<Line<'
 }
 
 /// The settings modal: the SSH launcher choices, with the draft highlighted.
-/// Sized from its own content and clamped to the terminal, so it degrades to
-/// a clipped box on tiny screens rather than overflowing.
+/// Sized from its own content and clamped to the terminal. If the content is
+/// taller than the available area, it scrolls enough to keep the active row
+/// visible.
 fn render_settings_popup(frame: &mut Frame, draft: SshLauncher, t: &Theme) {
     let width = settings_popup_width(frame.area().width);
     let inner_width = width.saturating_sub(SETTINGS_CHROME_WIDTH);
@@ -1236,7 +1237,13 @@ fn render_settings_popup(frame: &mut Frame, draft: SshLauncher, t: &Theme) {
     if inner.height == 0 {
         return;
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+
+    let active_start = lines
+        .iter()
+        .position(|line| line.spans.iter().any(|span| span.content.as_ref() == "❯ "))
+        .unwrap_or(0);
+    let offset = form_scroll_offset(active_start, 1, inner.height as usize, lines.len());
+    frame.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), inner);
 }
 
 #[cfg(test)]
@@ -1798,6 +1805,30 @@ mod tests {
         assert_eq!(settings_popup_width(30), 26);
         assert_eq!(settings_popup_width(4), 0);
         assert_eq!(settings_popup_width(0), 0);
+    }
+
+    #[test]
+    fn settings_popup_scrolls_to_keep_the_draft_choice_visible() {
+        let mut app = sample_app(1);
+        app.open_settings();
+        if let Mode::Settings { launcher } = &mut app.mode {
+            *launcher = SshLauncher::Kitty;
+        }
+
+        // Kitty is the last choice, so on a terminal too short for every row
+        // it only stays on screen if the body scrolls to the selection.
+        // 40x12 stacks descriptions; 100x8 keeps them inline but has room for
+        // only a few rows.
+        for (w, h) in [(40, 12), (100, 8), (30, 10)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| render(f, &app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.lines().any(|line| line.contains("❯ Kitty")),
+                "{w}x{h}:\n{text}"
+            );
+        }
     }
 
     #[test]

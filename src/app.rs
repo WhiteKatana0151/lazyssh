@@ -324,9 +324,32 @@ impl App {
     /// Confirms the settings dialog: keeps `launcher` and writes it out. An
     /// unchanged choice closes the dialog without rewriting the config.
     pub fn commit_settings(&mut self, launcher: SshLauncher) -> Result<()> {
-        if self.set_launcher(launcher) {
-            self.config.save()?;
+        self.commit_settings_with(launcher, Config::save)
+    }
+
+    /// Persists a launcher candidate before making it the active preference.
+    /// Keeping the write behind a closure makes save failures deterministic in
+    /// tests without mutating process-wide config-directory environment.
+    fn commit_settings_with(
+        &mut self,
+        launcher: SshLauncher,
+        save: impl FnOnce(&Config) -> Result<()>,
+    ) -> Result<()> {
+        if self.config.launcher == launcher {
+            self.set_launcher(launcher);
+            return Ok(());
         }
+
+        // Preserve the selected draft if persistence fails so the user can
+        // retry or cancel without losing either choice.
+        self.mode = Mode::Settings { launcher };
+
+        let mut candidate = self.config.clone();
+        candidate.launcher = launcher;
+        save(&candidate)?;
+
+        self.config = candidate;
+        self.set_launcher(launcher);
         Ok(())
     }
 
@@ -412,6 +435,14 @@ impl App {
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<AppExit>> {
+    handle_key_with_settings_commit(app, key, App::commit_settings)
+}
+
+fn handle_key_with_settings_commit(
+    app: &mut App,
+    key: KeyEvent,
+    commit_settings: impl FnOnce(&mut App, SshLauncher) -> Result<()>,
+) -> Result<Option<AppExit>> {
     if key.kind == KeyEventKind::Release {
         return Ok(None);
     }
@@ -503,7 +534,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<AppExit>> {
             }
             KeyCode::Enter => {
                 let chosen = *launcher;
-                app.commit_settings(chosen)?;
+                if let Err(err) = commit_settings(app, chosen) {
+                    app.set_status(StatusKind::Warn, format!("Failed to save settings: {err}"));
+                }
                 Ok(None)
             }
             KeyCode::Esc => {
@@ -876,6 +909,72 @@ mod tests {
         app.open_settings();
 
         assert!(app.set_launcher(SshLauncher::Kitty));
+        assert_eq!(app.config.launcher, SshLauncher::Kitty);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.status_kind, StatusKind::Success);
+    }
+
+    #[test]
+    fn failed_settings_save_keeps_dialog_open_and_persisted_launcher() {
+        let mut app = App::new(Config::default());
+        app.open_settings();
+
+        let result =
+            app.commit_settings_with(SshLauncher::Kitty, |_| Err(anyhow::anyhow!("disk full")));
+
+        assert!(result.is_err(), "save failure must propagate");
+        // The persisted preference is untouched and the draft survives so
+        // the user can retry or cancel.
+        assert_eq!(app.config.launcher, SshLauncher::Auto);
+        assert!(matches!(
+            app.mode,
+            Mode::Settings {
+                launcher: SshLauncher::Kitty
+            }
+        ));
+        assert_ne!(app.status_kind, StatusKind::Success);
+    }
+
+    #[test]
+    fn settings_enter_absorbs_save_error_and_shows_warning() {
+        let mut app = App::new(Config::default());
+        app.mode = Mode::Settings {
+            launcher: SshLauncher::Kitty,
+        };
+
+        let result = handle_key_with_settings_commit(
+            &mut app,
+            KeyEvent::from(KeyCode::Enter),
+            |app, launcher| {
+                app.commit_settings_with(launcher, |_| Err(anyhow::anyhow!("disk full")))
+            },
+        );
+
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(app.config.launcher, SshLauncher::Auto);
+        assert!(matches!(
+            app.mode,
+            Mode::Settings {
+                launcher: SshLauncher::Kitty
+            }
+        ));
+        assert_eq!(app.status_kind, StatusKind::Warn);
+        assert!(app.status.contains("disk full"));
+    }
+
+    #[test]
+    fn successful_settings_save_writes_choice_then_closes() {
+        let mut app = App::new(Config::default());
+        app.open_settings();
+
+        let mut saved = None;
+        app.commit_settings_with(SshLauncher::Kitty, |config| {
+            saved = Some(config.launcher);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(saved, Some(SshLauncher::Kitty));
         assert_eq!(app.config.launcher, SshLauncher::Kitty);
         assert!(matches!(app.mode, Mode::Normal));
         assert_eq!(app.status_kind, StatusKind::Success);
