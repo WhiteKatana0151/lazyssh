@@ -186,6 +186,8 @@ pub enum FormPurpose {
 #[derive(Debug)]
 pub enum Mode {
     Normal,
+    /// Inline live filtering in the server card header.
+    Search,
     /// The add/edit/bootstrap dialog.
     Form {
         draft: DraftServer,
@@ -225,6 +227,7 @@ pub enum AppExit {
 pub struct App {
     pub config: Config,
     pub selected: usize,
+    pub filter: String,
     pub mode: Mode,
     pub status: String,
     pub status_kind: StatusKind,
@@ -239,6 +242,7 @@ impl App {
         Self {
             config,
             selected: 0,
+            filter: String::new(),
             mode: Mode::Normal,
             status: String::new(),
             status_kind: StatusKind::Hint,
@@ -251,20 +255,53 @@ impl App {
         self.status = message.into();
     }
 
+    /// Returns the selected server only while it matches the live query.
     pub fn selected_server(&self) -> Option<&Server> {
-        self.config.servers.get(self.selected)
+        self.config
+            .servers
+            .get(self.selected)
+            .filter(|server| matches_filter(server, &self.filter))
     }
 
-    pub fn select_next(&mut self) {
-        if self.config.servers.is_empty() {
-            self.selected = 0;
-            return;
+    /// Full config indices of servers matching the live query, in list order.
+    pub fn visible_indices(&self) -> Vec<usize> {
+        self.config
+            .servers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, server)| matches_filter(server, &self.filter).then_some(index))
+            .collect()
+    }
+
+    /// Keeps selection on a matching server after filtering or mutation.
+    fn ensure_selection_visible(&mut self) {
+        let indices = self.visible_indices();
+        if !indices.contains(&self.selected) {
+            self.selected = indices.first().copied().unwrap_or(0);
         }
-        self.selected = (self.selected + 1).min(self.config.servers.len() - 1);
     }
 
+    /// Moves forward through matching servers, clamping at the end.
+    pub fn select_next(&mut self) {
+        let indices = self.visible_indices();
+        let position = indices.iter().position(|&index| index == self.selected);
+        self.selected = indices
+            .get(position.map_or(0, |p| (p + 1).min(indices.len() - 1)))
+            .copied()
+            .unwrap_or(0);
+    }
+
+    /// Moves backward through matching servers, clamping at the start.
     pub fn select_prev(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        let indices = self.visible_indices();
+        let position = indices
+            .iter()
+            .position(|&index| index == self.selected)
+            .unwrap_or(0);
+        self.selected = indices
+            .get(position.saturating_sub(1))
+            .copied()
+            .unwrap_or(0);
     }
 
     pub fn open_add(&mut self) {
@@ -354,7 +391,7 @@ impl App {
     }
 
     pub fn request_delete(&mut self) {
-        if self.config.servers.is_empty() {
+        if self.selected_server().is_none() {
             self.set_status(StatusKind::Warn, "No servers to delete");
             return;
         }
@@ -363,12 +400,22 @@ impl App {
     }
 
     pub fn delete_selected(&mut self) -> Result<()> {
+        self.delete_selected_with(Config::save)
+    }
+
+    /// Deletes a visible selection with injectable persistence for tests.
+    fn delete_selected_with(&mut self, save: impl FnOnce(&Config) -> Result<()>) -> Result<()> {
+        if self.selected_server().is_none() {
+            return Ok(());
+        }
         let removed = self.config.remove(self.selected);
-        self.config.save()?;
 
         if self.selected >= self.config.servers.len() {
             self.selected = self.config.servers.len().saturating_sub(1);
         }
+
+        self.ensure_selection_visible();
+        save(&self.config)?;
 
         if let Some(server) = removed {
             self.set_status(StatusKind::Success, format!("Deleted {}", server.name));
@@ -403,6 +450,11 @@ impl App {
     }
 
     pub fn save_draft(&mut self) -> Result<()> {
+        self.save_draft_with(Config::save)
+    }
+
+    /// Saves the form and rechecks visibility with injectable persistence.
+    fn save_draft_with(&mut self, save: impl FnOnce(&Config) -> Result<()>) -> Result<()> {
         let Mode::Form { draft, purpose, .. } = &self.mode else {
             return Ok(());
         };
@@ -424,7 +476,8 @@ impl App {
                         self.set_status(StatusKind::Success, format!("Saved {name}"));
                     }
                 }
-                self.config.save()?;
+                self.ensure_selection_visible();
+                save(&self.config)?;
             }
             // Keep the dialog open so the input can be corrected.
             Err(reason) => self.set_status(StatusKind::Warn, reason),
@@ -432,6 +485,17 @@ impl App {
 
         Ok(())
     }
+}
+
+/// Matches name, host, or description without case sensitivity.
+pub fn matches_filter(server: &Server, query: &str) -> bool {
+    if query.trim().is_empty() {
+        return true;
+    }
+    let query = query.to_lowercase();
+    [&server.name, &server.host, &server.description]
+        .iter()
+        .any(|value| value.to_lowercase().contains(&query))
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<AppExit>> {
@@ -453,6 +517,17 @@ fn handle_key_with_settings_commit(
 
     match &mut app.mode {
         Mode::Normal => match key.code {
+            KeyCode::Char('/') => {
+                app.mode = Mode::Search;
+                app.status_kind = StatusKind::Hint;
+                Ok(None)
+            }
+            KeyCode::Esc if !app.filter.is_empty() => {
+                app.filter.clear();
+                app.ensure_selection_visible();
+                app.status_kind = StatusKind::Hint;
+                Ok(None)
+            }
             KeyCode::Char('q' | 'Q') | KeyCode::Esc => Ok(Some(AppExit::Quit)),
             KeyCode::Char('j' | 'J') | KeyCode::Down => {
                 app.select_next();
@@ -492,6 +567,23 @@ fn handle_key_with_settings_commit(
             }
             _ => Ok(None),
         },
+        Mode::Search => {
+            match key.code {
+                KeyCode::Enter => app.mode = Mode::Normal,
+                KeyCode::Esc => {
+                    app.filter.clear();
+                    app.mode = Mode::Normal;
+                }
+                KeyCode::Backspace => {
+                    app.filter.pop();
+                }
+                KeyCode::Char(c) => app.filter.push(c),
+                _ => {}
+            }
+            app.ensure_selection_visible();
+            app.status_kind = StatusKind::Hint;
+            Ok(None)
+        }
         Mode::Form { draft, field, .. } => match key.code {
             KeyCode::Esc => {
                 app.mode = Mode::Normal;
@@ -577,6 +669,123 @@ mod tests {
             extra_args: None,
             last_connected_at: None,
         }
+    }
+
+    #[test]
+    fn filter_matches_all_searchable_fields() {
+        let mut server = sample_server("Prod API");
+        server.description = "European database".into();
+        for query in ["prod", "API", "EXAMPLE", "database", "EUROPEAN", "", "   "] {
+            assert!(matches_filter(&server, query), "{query}");
+        }
+        assert!(!matches_filter(&server, "missing"));
+    }
+
+    /// Builds alternating matches to exercise full-config selection indices.
+    fn filtered_app() -> App {
+        let mut app = App::new(Config::default());
+        for name in ["dev", "prod-a", "stage", "prod-b"] {
+            app.config.add(sample_server(name));
+        }
+        app.filter = "prod".into();
+        app.ensure_selection_visible();
+        app
+    }
+
+    #[test]
+    fn filtered_navigation_and_hidden_actions() {
+        let mut app = filtered_app();
+        assert_eq!(app.visible_indices(), vec![1, 3]);
+        assert_eq!(app.selected, 1);
+        app.select_next();
+        assert_eq!(app.selected, 3);
+        app.select_next();
+        assert_eq!(app.selected, 3);
+        app.select_prev();
+        assert_eq!(app.selected, 1);
+        app.select_prev();
+        assert_eq!(app.selected, 1);
+        app.filter = "missing".into();
+        assert!(app.selected_server().is_none());
+        assert_eq!(handle_key(&mut app, KeyCode::Enter.into()).unwrap(), None);
+        assert_eq!(app.status, "No server selected");
+        app.open_edit();
+        app.request_delete();
+        assert!(matches!(app.mode, Mode::Normal));
+        app.delete_selected_with(|_| panic!("hidden selection must not save"))
+            .unwrap();
+        app.ensure_selection_visible();
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn search_key_lifecycle() {
+        let mut app = filtered_app();
+        app.filter.clear();
+        handle_key(&mut app, KeyCode::Char('/').into()).unwrap();
+        assert!(matches!(app.mode, Mode::Search));
+        for ch in "prodX".chars() {
+            handle_key(&mut app, KeyCode::Char(ch).into()).unwrap();
+        }
+        assert!(app.visible_indices().is_empty());
+        handle_key(&mut app, KeyCode::Backspace.into()).unwrap();
+        assert_eq!(app.visible_indices(), vec![1, 3]);
+        assert_eq!(app.selected, 1);
+        handle_key(&mut app, KeyCode::Enter.into()).unwrap();
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.filter, "prod");
+        assert_eq!(handle_key(&mut app, KeyCode::Esc.into()).unwrap(), None);
+        assert!(app.filter.is_empty());
+        handle_key(&mut app, KeyCode::Char('/').into()).unwrap();
+        handle_key(&mut app, KeyCode::Char('p').into()).unwrap();
+        assert_eq!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            )
+            .unwrap(),
+            Some(AppExit::Quit)
+        );
+        handle_key(&mut app, KeyCode::Esc.into()).unwrap();
+        assert!(app.filter.is_empty());
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Esc.into()).unwrap(),
+            Some(AppExit::Quit)
+        );
+        app.filter = "prod".into();
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('q').into()).unwrap(),
+            Some(AppExit::Quit)
+        );
+    }
+
+    #[test]
+    fn mutations_reclamp_filtered_selection() {
+        let mut app = filtered_app();
+        app.open_edit();
+        if let Mode::Form { draft, .. } = &mut app.mode {
+            draft.name = "other".into();
+        }
+        app.save_draft_with(|_| Ok(())).unwrap();
+        assert_eq!(app.selected, 3);
+        app.delete_selected_with(|_| Ok(())).unwrap();
+        assert_eq!(app.selected, 0);
+        assert!(app.selected_server().is_none());
+        app.open_add();
+        if let Mode::Form { draft, .. } = &mut app.mode {
+            draft.name = "prod-new".into();
+            draft.host = "example.com".into();
+        }
+        app.save_draft_with(|_| Ok(())).unwrap();
+        assert_eq!(app.selected, 3);
+        app.open_add();
+        if let Mode::Form { draft, .. } = &mut app.mode {
+            draft.name = "hidden".into();
+            draft.host = "example.com".into();
+        }
+        app.save_draft_with(|_| Ok(())).unwrap();
+        assert_eq!(app.selected, 3);
     }
 
     #[test]

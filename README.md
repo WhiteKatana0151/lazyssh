@@ -11,8 +11,9 @@ It stores only connection metadata and SSH key paths. It does not store password
 - Blinking add-form cursor without busy-looping.
 - Responsive layout: full wordmark and server card on wide terminals, compact single-column fallback on narrow terminals.
 - List saved SSH servers by name in a centered card with airy rows, a full-width selection bar, and a status dot per row.
-- Add a server from the TUI.
-- Delete a server.
+- Fixed-height, scrollable server card with overflow markers and a position counter.
+- Vim-style `/` search that live-filters by name, host, or description.
+- Add, edit, and delete servers from the TUI.
 - Connect through native OpenSSH or Kitty's SSH kitten, selected safely and configured from the TUI.
 - Persist entries at:
 
@@ -53,13 +54,28 @@ Main screen:
 ```text
 j / Down     move down
 k / Up       move up
+/            search by name, host, or description (live filter)
 a            add server
-e            edit selected server (coming soon)
+e            edit selected server
 d            delete selected server
+b            bootstrap a new server (install your public key)
 s            SSH launcher settings
 Enter        connect to selected server
-q / Esc      quit
+Esc          clear the active filter, or quit when none is active
+q            quit
 ```
+
+Search mode (after `/`):
+
+```text
+type         filter the list as you type
+Backspace    erase
+Enter        keep the filter and return to the list
+Esc          clear the filter and return to the list
+```
+
+The server card keeps a fixed height of up to 10 rows; longer lists scroll,
+with `▲ n more` / `▼ n more` markers and a `current/total` counter.
 
 SSH launcher settings:
 

@@ -24,6 +24,8 @@ const HEADER_TALL_MIN_HEIGHT: u16 = 24;
 const HEADER_HEIGHT_TALL: u16 = 11;
 const HEADER_HEIGHT_COMPACT: u16 = 2;
 const FOOTER_HEIGHT: u16 = 3;
+/// Maximum card body rows, including scroll indicators.
+const CARD_MAX_ROWS: usize = 10;
 
 /// The LAZYSSH wordmark. Every line must have the same visible width; the
 /// same text is drawn twice — once as a shadow, once as the main layer — to
@@ -61,6 +63,7 @@ const NORMAL_HELP: &[(&str, &str)] = &[
     ("D", "Delete"),
     ("B", "Bootstrap"),
     ("S", "Settings"),
+    ("/", "Search"),
     ("Enter", "Connect"),
     ("Q", "Quit"),
 ];
@@ -70,9 +73,12 @@ const NORMAL_HELP_SHORT: &[(&str, &str)] = &[
     ("D", ""),
     ("B", ""),
     ("S", ""),
+    ("/", ""),
     ("↵", ""),
     ("Q", ""),
 ];
+
+const SEARCH_HELP: &[(&str, &str)] = &[("Enter", "Apply"), ("Esc", "Clear"), ("Type", "Filter")];
 
 const FORM_HELP: &[(&str, &str)] = &[
     ("Enter/Tab", "Next"),
@@ -120,7 +126,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         } => render_form_popup(frame, app, draft, *field, *purpose, t),
         Mode::ConfirmDelete => render_confirm_popup(frame, app, t),
         Mode::Settings { launcher } => render_settings_popup(frame, *launcher, t),
-        Mode::Normal => {}
+        Mode::Normal | Mode::Search => {}
     }
 }
 
@@ -188,14 +194,42 @@ fn card_width(area_width: u16) -> u16 {
     area_width.saturating_sub(6).clamp(20, 62)
 }
 
-/// Card height: one line per server plus the SERVERS header, its divider,
-/// one row of vertical padding on each side, and the borders.
-fn card_height(rows: usize, empty: bool) -> u16 {
-    if empty {
+/// Card height capped at the body row budget plus header, divider, padding,
+/// and borders, shrinking to the available terminal height.
+fn card_height(rows: usize, empty: bool, available: u16) -> u16 {
+    let desired = if empty {
         10
     } else {
-        rows as u16 + 6
+        rows.clamp(1, CARD_MAX_ROWS) as u16 + 6
+    };
+    desired.min(available)
+}
+
+/// Plans `(offset, shown, hidden above, hidden below)` within the body budget.
+/// Indicators consume rows; budgets below three prioritize the selected server.
+fn card_rows_plan(total: usize, selected: usize, budget: usize) -> (usize, usize, usize, usize) {
+    if total == 0 || budget == 0 {
+        return (0, 0, 0, 0);
     }
+    let selected = selected.min(total - 1);
+    if total <= budget {
+        return (0, total, 0, 0);
+    }
+    if budget < 3 {
+        let offset = scroll_offset(selected, total, budget);
+        return (offset, budget, 0, 0);
+    }
+    // Start with both indicators reserved, then reclaim unused edge rows.
+    let mut shown = budget - 2;
+    let mut offset = scroll_offset(selected, total, shown);
+    if offset == 0 {
+        shown += 1;
+    }
+    if offset + shown >= total {
+        shown = budget - 1;
+        offset = total - shown;
+    }
+    (offset, shown, offset, total - offset - shown)
 }
 
 /// Most rows of wrapped description text shown in the inspector box.
@@ -451,12 +485,12 @@ fn render_header(frame: &mut Frame, area: Rect, wide: bool, t: &Theme) {
 /// below that when there is room. The hint is the first thing dropped on
 /// short terminals; the inspector shrinks before disappearing.
 fn render_main(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
-    let rows = app.config.servers.len();
+    let rows = app.visible_indices().len();
     let empty = rows == 0;
     let width = card_width(area.width).min(area.width);
-    let height = card_height(rows, empty).min(area.height);
+    let height = card_height(rows, empty, area.height);
 
-    let show_inspector = matches!(app.mode, Mode::Normal);
+    let show_inspector = matches!(app.mode, Mode::Normal | Mode::Search);
     let full_desc_h = match app.selected_server().filter(|_| show_inspector) {
         Some(server) => {
             let lines =
@@ -605,29 +639,68 @@ fn render_server_card(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(t.border))
         .style(Style::default().bg(t.panel_bg))
-        .padding(Padding::new(0, 0, 1, 1));
+        .padding(Padding::new(
+            0,
+            0,
+            u16::from(area.height >= 7),
+            u16::from(area.height >= 7),
+        ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if app.config.servers.is_empty() {
+    if app.config.servers.is_empty() && app.filter.is_empty() && !matches!(app.mode, Mode::Search) {
         render_empty_state(frame, inner, t);
         return;
     }
 
-    let total = app.config.servers.len();
-    let visible = visible_rows(inner.height);
-    let offset = scroll_offset(app.selected, total, visible);
+    let indices = app.visible_indices();
+    let total = indices.len();
+    let selected = indices.iter().position(|&i| i == app.selected).unwrap_or(0);
+    let budget = visible_rows(inner.height);
+    let (offset, shown, above, below) = card_rows_plan(total, selected, budget);
 
     let most_recent = most_recent_index(&app.config.servers);
     let mut lines = card_header_lines(inner.width, t);
-    for (i, server) in app
-        .config
-        .servers
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(visible)
-    {
+    let counter = if total > budget {
+        format!("{}/{}", selected + 1, total)
+    } else {
+        String::new()
+    };
+    if !app.filter.is_empty() || matches!(app.mode, Mode::Search) {
+        let header = &mut lines[0];
+        header.spans.push(Span::raw("  "));
+        header
+            .spans
+            .push(Span::styled("/", Style::default().fg(t.green)));
+        let room = (inner.width as usize).saturating_sub(header.width() + counter.len() + 2);
+        header.spans.push(Span::styled(
+            truncate_label(&app.filter, room),
+            Style::default().fg(t.primary),
+        ));
+        if matches!(app.mode, Mode::Search) && cursor_visible(app.tick) {
+            header
+                .spans
+                .push(Span::styled("▏", Style::default().fg(t.primary)));
+        }
+    }
+    if !counter.is_empty() {
+        let gap = (inner.width as usize).saturating_sub(lines[0].width() + counter.len());
+        lines[0].spans.push(Span::raw(" ".repeat(gap)));
+        lines[0]
+            .spans
+            .push(Span::styled(counter, Style::default().fg(t.muted)));
+    }
+    if total == 0 {
+        lines.push(
+            Line::styled(
+                format!("no matches for \"{}\"", app.filter),
+                Style::default().fg(t.muted),
+            )
+            .alignment(Alignment::Center),
+        );
+    }
+    for &i in indices.iter().skip(offset).take(shown) {
+        let server = &app.config.servers[i];
         let recency = if most_recent == Some(i) {
             RowRecency::Recent
         } else if server.last_connected_at.is_some() {
@@ -642,6 +715,18 @@ fn render_server_card(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
             recency,
             t,
         ));
+    }
+
+    for (arrow, count) in [("▲", above), ("▼", below)] {
+        if count > 0 {
+            lines.push(
+                Line::styled(
+                    format!("{arrow} {count} more"),
+                    Style::default().fg(t.muted).add_modifier(Modifier::DIM),
+                )
+                .alignment(Alignment::Center),
+            );
+        }
     }
 
     frame.render_widget(
@@ -756,6 +841,7 @@ fn render_description_box(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
 fn help_for(mode: &Mode) -> &'static [(&'static str, &'static str)] {
     match mode {
         Mode::Normal => NORMAL_HELP,
+        Mode::Search => SEARCH_HELP,
         Mode::Form { .. } => FORM_HELP,
         Mode::ConfirmDelete => CONFIRM_HELP,
         Mode::Settings { .. } => SETTINGS_HELP,
@@ -765,6 +851,7 @@ fn help_for(mode: &Mode) -> &'static [(&'static str, &'static str)] {
 fn short_help_for(mode: &Mode) -> &'static [(&'static str, &'static str)] {
     match mode {
         Mode::Normal => NORMAL_HELP_SHORT,
+        Mode::Search => SEARCH_HELP,
         Mode::Form { .. } => FORM_HELP_SHORT,
         Mode::ConfirmDelete => CONFIRM_HELP,
         Mode::Settings { .. } => SETTINGS_HELP_SHORT,
@@ -778,13 +865,20 @@ fn hint_fits(line: &Line<'static>, area_width: u16) -> bool {
 }
 
 /// The widest hint line that fits `area_width`: the full badge set first,
-/// then the same set with tighter separators, and only then the key caps on
-/// their own. Labels are worth more than whitespace when space runs out.
-fn footer_hint(mode: &Mode, area_width: u16, t: &Theme) -> Line<'static> {
+/// then the same set with tighter separators, then the tight set with labels
+/// dropped from the tail one at a time (help lists end with their most
+/// self-explanatory keys), and only then the key caps on their own. Labels
+/// are worth more than whitespace when space runs out.
+fn footer_hint(mode: &Mode, filter_active: bool, area_width: u16, t: &Theme) -> Line<'static> {
+    let mut full = help_for(mode).to_vec();
+    let mut short = short_help_for(mode).to_vec();
+    if matches!(mode, Mode::Normal) && filter_active {
+        full.push(("Esc", "Clear filter"));
+        short.push(("Esc", "Clear filter"));
+    }
     let candidates = [
-        (help_for(mode), HINT_SEP),
-        (help_for(mode), HINT_SEP_TIGHT),
-        (short_help_for(mode), HINT_SEP),
+        (full.as_slice(), HINT_SEP),
+        (full.as_slice(), HINT_SEP_TIGHT),
     ];
     for (pairs, sep) in candidates {
         let line = hint_line_with(pairs, sep, t);
@@ -792,7 +886,22 @@ fn footer_hint(mode: &Mode, area_width: u16, t: &Theme) -> Line<'static> {
             return line;
         }
     }
-    hint_line_with(short_help_for(mode), HINT_SEP_TIGHT, t)
+    let mut trimmed = full.clone();
+    for i in (0..trimmed.len()).rev() {
+        if trimmed[i].1.is_empty() {
+            continue;
+        }
+        trimmed[i].1 = "";
+        let line = hint_line_with(&trimmed, HINT_SEP_TIGHT, t);
+        if hint_fits(&line, area_width) {
+            return line;
+        }
+    }
+    let line = hint_line_with(&short, HINT_SEP, t);
+    if hint_fits(&line, area_width) {
+        return line;
+    }
+    hint_line_with(&short, HINT_SEP_TIGHT, t)
 }
 
 /// The bottom command bar: a centered, bordered box holding either the
@@ -800,7 +909,7 @@ fn footer_hint(mode: &Mode, area_width: u16, t: &Theme) -> Line<'static> {
 /// shortened badge set when the terminal is too narrow for the full one.
 fn render_footer(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let line = match app.status_kind {
-        StatusKind::Hint => footer_hint(&app.mode, area.width, t),
+        StatusKind::Hint => footer_hint(&app.mode, !app.filter.is_empty(), area.width, t),
         StatusKind::Success => Line::from(vec![
             Span::styled("✓ ", Style::default().fg(t.green)),
             Span::styled(app.status.clone(), Style::default().fg(t.green)),
@@ -1276,6 +1385,69 @@ mod tests {
     }
 
     #[test]
+    fn card_caps_and_shrinks() {
+        assert_eq!(card_height(42, false, 100), CARD_MAX_ROWS as u16 + 6);
+        assert_eq!(card_height(usize::MAX, false, 100), 16);
+        for height in 0..16 {
+            assert_eq!(card_height(42, false, height), height);
+        }
+    }
+
+    #[test]
+    fn row_plan_accounts_for_indicators() {
+        assert_eq!(card_rows_plan(4, 2, 10), (0, 4, 0, 0));
+        assert_eq!(card_rows_plan(42, 2, 10), (0, 9, 0, 33));
+        assert_eq!(card_rows_plan(42, 10, 10), (3, 8, 3, 31));
+        assert_eq!(card_rows_plan(42, 41, 10), (33, 9, 33, 0));
+        for total in 0..50 {
+            for selected in 0..total {
+                for budget in 0..=10 {
+                    let (offset, shown, above, below) = card_rows_plan(total, selected, budget);
+                    assert!(shown + usize::from(above > 0) + usize::from(below > 0) <= budget);
+                    if budget > 0 {
+                        assert!((offset..offset + shown).contains(&selected));
+                        assert!(offset + shown <= total);
+                    }
+                    if budget >= 3 {
+                        assert_eq!(above, offset);
+                        assert_eq!(below, total - offset - shown);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_header_counter_and_tiny_card_render() {
+        let mut app = sample_app(42);
+        for server in &mut app.config.servers {
+            server.description = "prod".into();
+        }
+        app.filter = "prod".into();
+        app.selected = 2;
+        app.mode = Mode::Search;
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        let header = text.lines().find(|line| line.contains("SERVERS")).unwrap();
+        assert!(header.contains("/prod▏"), "{text}");
+        assert!(header.contains("3/42"), "{text}");
+        assert!(text.contains("▼ 33 more"));
+        app.filter = "missing".into();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        assert!(buffer_text(&terminal).contains("no matches for \"missing\""));
+        for height in 0..8 {
+            let mut terminal = Terminal::new(TestBackend::new(30, height)).unwrap();
+            terminal
+                .draw(|f| render_server_card(f, &app, f.area(), &Theme::TRUECOLOR))
+                .unwrap();
+        }
+        let help = footer_hint(&Mode::Normal, true, 200, &Theme::TRUECOLOR);
+        assert!(help.to_string().contains("Clear filter"));
+        assert!(help_for(&Mode::Search).contains(&("Enter", "Apply")));
+    }
+
+    #[test]
     fn wide_layout_kicks_in_at_threshold() {
         assert!(!use_wide_layout(WIDE_LAYOUT_MIN_WIDTH - 1));
         assert!(use_wide_layout(WIDE_LAYOUT_MIN_WIDTH));
@@ -1311,10 +1483,10 @@ mod tests {
 
     #[test]
     fn card_height_accounts_for_header_and_chrome() {
-        assert_eq!(card_height(0, true), 10);
-        assert_eq!(card_height(1, false), 7);
-        assert_eq!(card_height(3, false), 9);
-        assert_eq!(card_height(10, false), 16);
+        assert_eq!(card_height(0, true, 100), 10);
+        assert_eq!(card_height(1, false, 100), 7);
+        assert_eq!(card_height(3, false, 100), 9);
+        assert_eq!(card_height(10, false, 100), 16);
     }
 
     #[test]
@@ -1682,7 +1854,7 @@ mod tests {
     #[test]
     fn normal_footer_advertises_bootstrap() {
         let app = sample_app(1);
-        let backend = TestBackend::new(100, 34);
+        let backend = TestBackend::new(120, 34);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(f, &app)).unwrap();
         assert!(buffer_text(&terminal).contains("Bootstrap"));
@@ -1691,7 +1863,7 @@ mod tests {
     #[test]
     fn normal_footer_advertises_settings() {
         let app = sample_app(1);
-        let backend = TestBackend::new(100, 34);
+        let backend = TestBackend::new(120, 34);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(f, &app)).unwrap();
         let text = buffer_text(&terminal);
@@ -1708,17 +1880,32 @@ mod tests {
         let short = hint_line_with(NORMAL_HELP_SHORT, HINT_SEP, t);
         assert!(tight.width() < full.width());
 
-        let width = |w: u16| footer_hint(&Mode::Normal, w, t).width();
+        let width = |w: u16| footer_hint(&Mode::Normal, false, w, t).width();
         // Room for everything.
         assert_eq!(width(full.width() as u16 + 4), full.width());
         // One column short: labels survive, the spacing gives way first.
         assert_eq!(width(full.width() as u16 + 3), tight.width());
-        // Too narrow for any labelled set: key caps only.
-        assert_eq!(width(short.width() as u16 + 4), short.width());
+        // Just wide enough for the key caps: whatever is returned must fit,
+        // and the tightest fallback still applies at zero width.
+        assert!(width(short.width() as u16 + 4) + 4 <= short.width() + 4);
         assert_eq!(
             width(0),
             hint_line_with(NORMAL_HELP_SHORT, HINT_SEP_TIGHT, t).width()
         );
+    }
+
+    #[test]
+    fn footer_hint_drops_labels_from_the_tail_before_all_of_them() {
+        let t = &Theme::TRUECOLOR;
+        let tight = hint_line_with(NORMAL_HELP, HINT_SEP_TIGHT, t);
+        // Just too narrow for the tight full set: only the trailing labels
+        // go, so a 100-column terminal still explains the front keys.
+        let line = footer_hint(&Mode::Normal, false, tight.width() as u16 + 3, t);
+        let text = line.to_string();
+        assert!(text.contains("Add"), "{text}");
+        assert!(text.contains("Edit"), "{text}");
+        assert!(!text.contains("Quit"), "{text}");
+        assert!(hint_fits(&line, tight.width() as u16 + 3));
     }
 
     #[test]
