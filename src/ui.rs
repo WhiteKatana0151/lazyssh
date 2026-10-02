@@ -10,8 +10,11 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, DraftServer, Field, FormPurpose, Mode, StatusKind};
+use crate::app::{App, DraftServer, Field, FormPurpose, ImportCandidate, Mode, StatusKind};
 use crate::config::{Server, SshLauncher};
+use crate::forwards::ForwardKey;
+use crate::probe::Reach;
+use crate::ssh::LaunchMode;
 use crate::theme::{theme, Theme};
 
 /// Terminal width at which the dashboard switches from a compact single-line
@@ -57,26 +60,80 @@ enum MarkTone {
 const SUBTITLE: &str = "SSH made simple. Connect. Work. Done.";
 const SUBTITLE_DIVIDER_WIDTH: usize = 12;
 
+/// The footer only advertises the everyday keys; `?` lists the rest.
 const NORMAL_HELP: &[(&str, &str)] = &[
     ("A", "Add"),
     ("E", "Edit"),
     ("D", "Delete"),
-    ("B", "Bootstrap"),
-    ("S", "Settings"),
     ("/", "Search"),
     ("Enter", "Connect"),
+    ("?", "Help"),
     ("Q", "Quit"),
 ];
 const NORMAL_HELP_SHORT: &[(&str, &str)] = &[
     ("A", ""),
     ("E", ""),
     ("D", ""),
-    ("B", ""),
-    ("S", ""),
     ("/", ""),
     ("↵", ""),
+    ("?", ""),
     ("Q", ""),
 ];
+
+/// Every key, grouped, for the `?` overlay.
+const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Navigate",
+        &[
+            ("j / ↓", "Next server"),
+            ("k / ↑", "Previous server"),
+            ("/", "Search: words, #tag, # = any tag"),
+            ("Esc", "Clear filter, else quit"),
+        ],
+    ),
+    (
+        "Connect",
+        &[
+            ("Enter", "SSH to selected server"),
+            ("o", "Open as SSH / SFTP / Mosh"),
+            ("f", "Start/stop saved port forwards"),
+            ("y", "Copy the ssh command"),
+        ],
+    ),
+    (
+        "Manage",
+        &[
+            ("a", "Add server"),
+            ("e", "Edit server"),
+            ("D", "Duplicate server"),
+            ("d", "Delete server"),
+            ("p", "Pin / unpin to the top"),
+            ("i", "Import from ~/.ssh/config"),
+            ("b", "Bootstrap: install your key"),
+        ],
+    ),
+    (
+        "App",
+        &[
+            ("r", "Re-check reachability"),
+            ("s", "SSH launcher settings"),
+            ("?", "This help"),
+            ("q", "Quit"),
+        ],
+    ),
+];
+
+const LIST_DIALOG_HELP: &[(&str, &str)] = &[("j/k", "Move"), ("Enter", "Choose"), ("Esc", "Close")];
+const IMPORT_HELP: &[(&str, &str)] = &[
+    ("Space", "Toggle"),
+    ("A", "All"),
+    ("Enter", "Import"),
+    ("Esc", "Cancel"),
+];
+const IMPORT_HELP_SHORT: &[(&str, &str)] = &[("Space", ""), ("A", ""), ("↵", ""), ("Esc", "")];
+const FORWARDS_HELP: &[(&str, &str)] =
+    &[("j/k", "Move"), ("Enter", "Start/Stop"), ("Esc", "Close")];
+const HELP_OVERLAY_HELP: &[(&str, &str)] = &[("Any key", "Close")];
 
 const SEARCH_HELP: &[(&str, &str)] = &[("Enter", "Apply"), ("Esc", "Clear"), ("Type", "Filter")];
 
@@ -126,6 +183,10 @@ pub fn render(frame: &mut Frame, app: &App) {
         } => render_form_popup(frame, app, draft, *field, *purpose, t),
         Mode::ConfirmDelete => render_confirm_popup(frame, app, t),
         Mode::Settings { launcher } => render_settings_popup(frame, *launcher, t),
+        Mode::Help => render_help_popup(frame, t),
+        Mode::Launch { mode } => render_launch_popup(frame, app, *mode, t),
+        Mode::Import { candidates, cursor } => render_import_popup(frame, candidates, *cursor, t),
+        Mode::Forwards { cursor } => render_forwards_popup(frame, app, *cursor, t),
         Mode::Normal | Mode::Search => {}
     }
 }
@@ -495,7 +556,8 @@ fn render_main(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         Some(server) => {
             let lines =
                 description_lines(&server.description, desc_text_width(width), DESC_MAX_LINES);
-            desc_box_height(lines.len())
+            // One extra row for the connection summary above the text.
+            desc_box_height(lines.len()) + 1
         }
         None => 0,
     };
@@ -551,23 +613,61 @@ fn most_recent_index(servers: &[Server]) -> Option<usize> {
         .map(|(_, i)| i)
 }
 
-/// One server row: `  ❯ ▣ name ······ ●  `, padded to exactly `width`
-/// characters so the selection bar can tint the full card width. The most
-/// recently used server carries a dim `recent` tag before its dot.
+/// Per-row decorations beyond the name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowMarks {
+    recency: RowRecency,
+    pinned: bool,
+    reach: Option<Reach>,
+    /// Running port forwards for this server.
+    forwards: usize,
+}
+
+/// Status-dot glyph and color for a reachability result.
+fn reach_dot(reach: Option<Reach>, t: &Theme) -> (&'static str, Style) {
+    match reach {
+        Some(Reach::Up) => ("●", Style::default().fg(t.green)),
+        Some(Reach::Down) => ("●", Style::default().fg(t.warn)),
+        Some(Reach::ViaJump) => ("◆", Style::default().fg(t.primary)),
+        Some(Reach::Probing) => ("○", Style::default().fg(t.muted)),
+        None => ("●", Style::default().fg(t.muted)),
+    }
+}
+
+/// One server row: `  ❯ ★ name ······ ⇄2 recent ●  `, padded to exactly
+/// `width` characters so the selection bar can tint the full card width.
+/// The icon is a star for pinned servers, the dot shows reachability, and
+/// running forwards and the most recent server get small dim tags.
 fn server_row_line(
     name: &str,
     selected: bool,
     width: usize,
-    recency: RowRecency,
+    marks: RowMarks,
     t: &Theme,
 ) -> Line<'static> {
-    let tag = if recency == RowRecency::Recent {
+    let recency = marks.recency;
+    let mut tag = if recency == RowRecency::Recent {
         "recent "
     } else {
         ""
     };
-    // Chrome around the name: 2 lead + 2 chevron + 2 icon + 1 dot + 2 trail.
-    let chrome = 9 + tag.chars().count();
+    let mut fwd = if marks.forwards > 0 {
+        format!("⇄{} ", marks.forwards)
+    } else {
+        String::new()
+    };
+    // Fixed chrome: 2 lead + 2 chevron + 2 icon + 1 dot + 2 trail, plus at
+    // least a 1-cell name and 1 cell of padding. Optional tags go first —
+    // `recent`, then the forward count — when a narrow card has no room.
+    const FIXED: usize = 9;
+    let need = |tag: &str, fwd: &str| FIXED + 2 + tag.chars().count() + fwd.chars().count();
+    if need(tag, &fwd) > width {
+        tag = "";
+    }
+    if need(tag, &fwd) > width {
+        fwd.clear();
+    }
+    let chrome = FIXED + tag.chars().count() + fwd.chars().count();
     let label = truncate_label(name, width.saturating_sub(chrome + 1));
     let pad = width.saturating_sub(chrome + label.chars().count()).max(1);
 
@@ -587,10 +687,11 @@ fn server_row_line(
         )
     };
 
-    let dot_color = if recency == RowRecency::Never {
-        t.muted
+    let (dot, dot_style) = reach_dot(marks.reach, t);
+    let (icon, icon_style) = if marks.pinned {
+        ("★ ", Style::default().fg(t.warn))
     } else {
-        t.green
+        ("▣ ", icon_style)
     };
 
     let line = Line::from(vec![
@@ -599,11 +700,12 @@ fn server_row_line(
             chevron,
             Style::default().fg(t.green).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("▣ ", icon_style),
+        Span::styled(icon, icon_style),
         Span::styled(label, name_style),
         Span::raw(" ".repeat(pad)),
+        Span::styled(fwd, Style::default().fg(t.primary)),
         Span::styled(tag.to_string(), Style::default().fg(t.muted)),
-        Span::styled("●", Style::default().fg(dot_color)),
+        Span::styled(dot, dot_style),
         Span::raw("  "),
     ]);
 
@@ -708,11 +810,17 @@ fn render_server_card(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         } else {
             RowRecency::Never
         };
+        let marks = RowMarks {
+            recency,
+            pinned: server.pinned,
+            reach: app.reach_of(server),
+            forwards: app.forwards.count_for(&server.name),
+        };
         lines.push(server_row_line(
             &server.name,
             i == app.selected,
             inner.width as usize,
-            recency,
+            marks,
             t,
         ));
     }
@@ -817,25 +925,354 @@ fn render_description_box(frame: &mut Frame, app: &App, area: Rect, t: &Theme) {
         return;
     }
 
+    let mut out = vec![inspector_meta_line(app, server, inner.width as usize, t)];
     let lines = description_lines(
         &server.description,
         desc_text_width(area.width),
-        (inner.height as usize).min(DESC_MAX_LINES),
+        (inner.height as usize)
+            .saturating_sub(1)
+            .min(DESC_MAX_LINES),
     );
-    let paragraph = if lines.is_empty() {
-        Paragraph::new(Line::styled(
+    if lines.is_empty() {
+        out.push(Line::styled(
             "No description saved.",
             Style::default().fg(t.muted).add_modifier(Modifier::ITALIC),
-        ))
+        ));
     } else {
-        Paragraph::new(
+        out.extend(
             lines
                 .into_iter()
-                .map(|line| Line::styled(line, Style::default().fg(t.muted_primary)))
-                .collect::<Vec<_>>(),
+                .map(|line| Line::styled(line, Style::default().fg(t.muted_primary))),
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(out).style(Style::default().bg(t.panel_bg)),
+        inner,
+    );
+}
+
+/// Plain-text pieces of the inspector's connection summary:
+/// `user@host:port`, the jump host, then `#tags`.
+fn inspector_meta(server: &Server) -> (String, Option<String>, String) {
+    let jump = server
+        .jump_host
+        .as_deref()
+        .map(str::trim)
+        .filter(|j| !j.is_empty())
+        .map(|j| format!("via {j}"));
+    let tags = server
+        .tags
+        .iter()
+        .map(|tag| format!("#{tag}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (server.jump_destination(), jump, tags)
+}
+
+/// The connection summary row of the inspector, truncated to `width`.
+fn inspector_meta_line(app: &App, server: &Server, width: usize, t: &Theme) -> Line<'static> {
+    let (target, jump, tags) = inspector_meta(server);
+    let mut parts: Vec<(String, Style)> = vec![(target, Style::default().fg(t.text))];
+    if let Some(jump) = jump {
+        parts.push((jump, Style::default().fg(t.primary)));
+    }
+    let running = app.forwards.count_for(&server.name);
+    if running > 0 {
+        parts.push((
+            format!("⇄ {running} forward(s)"),
+            Style::default().fg(t.primary),
+        ));
+    }
+    if !tags.is_empty() {
+        parts.push((tags, Style::default().fg(t.green)));
+    }
+    let mut spans = Vec::new();
+    let mut used = 0;
+    for (i, (text, style)) in parts.into_iter().enumerate() {
+        let sep = if i == 0 { "" } else { "  ·  " };
+        let room = width.saturating_sub(used + sep.chars().count());
+        if room < 2 {
+            break;
+        }
+        let text = truncate_label(&text, room);
+        used += sep.chars().count() + text.chars().count();
+        if !sep.is_empty() {
+            spans.push(Span::styled(sep, Style::default().fg(t.border)));
+        }
+        spans.push(Span::styled(text, style));
+    }
+    Line::from(spans)
+}
+
+/// A rounded, titled modal of `width` x content height centered on screen,
+/// returning the inner area. Shared by the list dialogs below.
+fn modal(
+    frame: &mut Frame,
+    icon: &'static str,
+    title: &'static str,
+    width: u16,
+    content_rows: usize,
+    t: &Theme,
+) -> Rect {
+    let width = width.min(frame.area().width.saturating_sub(4));
+    let height = (content_rows as u16).saturating_add(4);
+    let area = centered_fixed(width, height, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t.primary))
+        .style(Style::default().bg(t.panel_bg))
+        .padding(Padding::new(2, 2, 1, 1))
+        .title(Line::from(vec![
+            Span::styled(icon, Style::default().fg(t.green)),
+            Span::styled(
+                title,
+                Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    inner
+}
+
+/// A selectable row padded to `width` so the highlight spans the dialog.
+fn choice_row(
+    marker_on: bool,
+    label: String,
+    detail: String,
+    label_width: usize,
+    width: usize,
+    t: &Theme,
+) -> Line<'static> {
+    let (marker, label_style, detail_style) = if marker_on {
+        (
+            Span::styled(
+                "❯ ",
+                Style::default().fg(t.green).add_modifier(Modifier::BOLD),
+            ),
+            Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
+            Style::default().fg(t.muted_primary),
+        )
+    } else {
+        (
+            Span::raw("  "),
+            Style::default().fg(t.text),
+            Style::default().fg(t.muted),
         )
     };
-    frame.render_widget(paragraph.style(Style::default().bg(t.panel_bg)), inner);
+    let label = truncate_label(&label, label_width);
+    let room = width.saturating_sub(2 + label_width + 1);
+    let detail = truncate_label(&detail, room);
+    let used = 2 + label_width + 1 + detail.chars().count();
+    let line = Line::from(vec![
+        marker,
+        Span::styled(format!("{label:<label_width$} "), label_style),
+        Span::styled(detail, detail_style),
+        Span::raw(" ".repeat(width.saturating_sub(used))),
+    ]);
+    if marker_on {
+        line.style(Style::default().bg(t.selected_bg))
+    } else {
+        line
+    }
+}
+
+/// Renders `rows` under a hint line, scrolled so `active` stays visible.
+fn render_rows(
+    frame: &mut Frame,
+    inner: Rect,
+    hint: Line<'static>,
+    rows: Vec<Line<'static>>,
+    active: usize,
+) {
+    let mut lines = vec![hint, Line::raw("")];
+    lines.extend(rows);
+    let offset = form_scroll_offset(active + 2, 1, inner.height as usize, lines.len());
+    frame.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), inner);
+}
+
+/// The `?` overlay: every key, grouped, in two aligned columns.
+fn help_overlay_lines(t: &Theme) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (i, (section, keys)) in HELP_SECTIONS.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::styled(
+            section.to_uppercase(),
+            Style::default().fg(t.green).add_modifier(Modifier::BOLD),
+        ));
+        for (key, what) in keys.iter() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {key:<9}"),
+                    Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled((*what).to_string(), Style::default().fg(t.text)),
+            ]));
+        }
+    }
+    lines
+}
+
+fn render_help_popup(frame: &mut Frame, t: &Theme) {
+    let lines = help_overlay_lines(t);
+    let width = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 8;
+    let inner = modal(frame, " ? ", "KEYS ", width, lines.len(), t);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_launch_popup(frame: &mut Frame, app: &App, active: LaunchMode, t: &Theme) {
+    let name = app
+        .selected_server()
+        .map(|s| s.name.clone())
+        .unwrap_or_default();
+    let rows_count = LaunchMode::ALL.len() + 2;
+    let inner = modal(frame, " ⏵ ", "OPEN AS ", 62, rows_count + 1, t);
+    let width = inner.width as usize;
+    let mut rows: Vec<Line<'static>> = LaunchMode::ALL
+        .iter()
+        .map(|&mode| {
+            let installed = crate::ssh::find_executable(mode.program()).is_some();
+            let detail = if installed || mode == LaunchMode::Ssh {
+                mode.description().to_string()
+            } else {
+                format!("{} — not installed", mode.description())
+            };
+            choice_row(
+                mode == active,
+                mode.label().to_string(),
+                detail,
+                6,
+                width,
+                t,
+            )
+        })
+        .collect();
+    rows.push(Line::raw(""));
+    rows.push(Line::styled(
+        truncate_label(&format!("server: {name}"), width),
+        Style::default().fg(t.muted),
+    ));
+    let active_row = LaunchMode::ALL
+        .iter()
+        .position(|m| *m == active)
+        .unwrap_or(0);
+    render_rows(
+        frame,
+        inner,
+        hint_line(LIST_DIALOG_HELP, t),
+        rows,
+        active_row,
+    );
+}
+
+/// Detail text for an import row: the target, the jump host, or why it is
+/// greyed out.
+fn import_detail(candidate: &ImportCandidate) -> String {
+    if candidate.exists {
+        return "already saved".to_string();
+    }
+    let mut detail = candidate.server.jump_destination();
+    if let Some(jump) = &candidate.server.jump_host {
+        detail.push_str(&format!(" via {jump}"));
+    }
+    detail
+}
+
+fn render_import_popup(
+    frame: &mut Frame,
+    candidates: &[ImportCandidate],
+    cursor: usize,
+    t: &Theme,
+) {
+    let rows_wanted = candidates.len().min(14);
+    let inner = modal(
+        frame,
+        " ⇣ ",
+        "IMPORT FROM ~/.ssh/config ",
+        72,
+        rows_wanted + 2,
+        t,
+    );
+    let width = inner.width as usize;
+    let rows = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let check = match (c.exists, c.chosen) {
+                (true, _) => "[-]",
+                (false, true) => "[x]",
+                (false, false) => "[ ]",
+            };
+            let line = choice_row(
+                i == cursor,
+                format!("{check} {}", c.server.name),
+                import_detail(c),
+                22,
+                width,
+                t,
+            );
+            if c.exists {
+                line.patch_style(Style::default().add_modifier(Modifier::DIM))
+            } else {
+                line
+            }
+        })
+        .collect();
+    let full = hint_line(IMPORT_HELP, t);
+    let hint = if full.width() > width {
+        hint_line(IMPORT_HELP_SHORT, t)
+    } else {
+        full
+    };
+    render_rows(frame, inner, hint, rows, cursor);
+}
+
+fn render_forwards_popup(frame: &mut Frame, app: &App, cursor: usize, t: &Theme) {
+    let Some(server) = app.selected_server() else {
+        return;
+    };
+    let inner = modal(
+        frame,
+        " ⇄ ",
+        "PORT FORWARDS ",
+        64,
+        server.forwards.len() + 4,
+        t,
+    );
+    let width = inner.width as usize;
+    let mut rows: Vec<Line<'static>> = server
+        .forwards
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| {
+            let running = app
+                .forwards
+                .is_running(&ForwardKey::new(&server.name, spec));
+            let state = if running {
+                "● running"
+            } else {
+                "○ stopped"
+            };
+            let line = choice_row(i == cursor, spec.clone(), state.to_string(), 30, width, t);
+            if running {
+                line.patch_style(Style::default().fg(t.green))
+            } else {
+                line
+            }
+        })
+        .collect();
+    rows.push(Line::raw(""));
+    rows.push(Line::styled(
+        truncate_label(
+            "Forwards need key/agent auth and stop when LazySSH quits.",
+            width,
+        ),
+        Style::default().fg(t.muted).add_modifier(Modifier::ITALIC),
+    ));
+    render_rows(frame, inner, hint_line(FORWARDS_HELP, t), rows, cursor);
 }
 
 fn help_for(mode: &Mode) -> &'static [(&'static str, &'static str)] {
@@ -845,6 +1282,10 @@ fn help_for(mode: &Mode) -> &'static [(&'static str, &'static str)] {
         Mode::Form { .. } => FORM_HELP,
         Mode::ConfirmDelete => CONFIRM_HELP,
         Mode::Settings { .. } => SETTINGS_HELP,
+        Mode::Help => HELP_OVERLAY_HELP,
+        Mode::Launch { .. } => LIST_DIALOG_HELP,
+        Mode::Import { .. } => IMPORT_HELP,
+        Mode::Forwards { .. } => FORWARDS_HELP,
     }
 }
 
@@ -855,6 +1296,10 @@ fn short_help_for(mode: &Mode) -> &'static [(&'static str, &'static str)] {
         Mode::Form { .. } => FORM_HELP_SHORT,
         Mode::ConfirmDelete => CONFIRM_HELP,
         Mode::Settings { .. } => SETTINGS_HELP_SHORT,
+        Mode::Help => HELP_OVERLAY_HELP,
+        Mode::Launch { .. } => SETTINGS_HELP_SHORT,
+        Mode::Import { .. } => IMPORT_HELP_SHORT,
+        Mode::Forwards { .. } => SETTINGS_HELP_SHORT,
     }
 }
 
@@ -873,8 +1318,10 @@ fn footer_hint(mode: &Mode, filter_active: bool, area_width: u16, t: &Theme) -> 
     let mut full = help_for(mode).to_vec();
     let mut short = short_help_for(mode).to_vec();
     if matches!(mode, Mode::Normal) && filter_active {
-        full.push(("Esc", "Clear filter"));
-        short.push(("Esc", "Clear filter"));
+        // Ahead of the self-explanatory `?`/`Q` tail, so their labels are
+        // dropped before this one when space runs out.
+        full.insert(full.len().saturating_sub(2), ("Esc", "Clear filter"));
+        short.insert(short.len().saturating_sub(2), ("Esc", ""));
     }
     let candidates = [
         (full.as_slice(), HINT_SEP),
@@ -1372,7 +1819,7 @@ mod tests {
             username: None,
             identity_file: None,
             extra_args: None,
-            last_connected_at: None,
+            ..Default::default()
         }
     }
 
@@ -1519,14 +1966,26 @@ mod tests {
         for width in [20usize, 40, 60] {
             for selected in [false, true] {
                 for recency in [RowRecency::Recent, RowRecency::Connected, RowRecency::Never] {
-                    let line = server_row_line(
-                        "staging-eu-west",
-                        selected,
-                        width,
-                        recency,
-                        &Theme::TRUECOLOR,
-                    );
-                    assert_eq!(line.width(), width, "width {width}, recency {recency:?}");
+                    for (pinned, reach, forwards) in [
+                        (false, None, 0),
+                        (true, Some(Reach::Up), 2),
+                        (false, Some(Reach::ViaJump), 12),
+                    ] {
+                        let marks = RowMarks {
+                            recency,
+                            pinned,
+                            reach,
+                            forwards,
+                        };
+                        let line = server_row_line(
+                            "staging-eu-west",
+                            selected,
+                            width,
+                            marks,
+                            &Theme::TRUECOLOR,
+                        );
+                        assert_eq!(line.width(), width, "width {width}, marks {marks:?}");
+                    }
                 }
             }
         }
@@ -1852,24 +2311,152 @@ mod tests {
     }
 
     #[test]
-    fn normal_footer_advertises_bootstrap() {
+    fn normal_footer_advertises_help_and_every_label_fits_at_100_cols() {
         let app = sample_app(1);
-        let backend = TestBackend::new(120, 34);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, &app)).unwrap();
-        assert!(buffer_text(&terminal).contains("Bootstrap"));
-    }
-
-    #[test]
-    fn normal_footer_advertises_settings() {
-        let app = sample_app(1);
-        let backend = TestBackend::new(120, 34);
+        let backend = TestBackend::new(100, 34);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(f, &app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("Settings"), "{text}");
-        // The tighter separators must not cost any other label either.
-        assert!(text.contains("Bootstrap"), "{text}");
+        for label in ["Add", "Edit", "Delete", "Search", "Connect", "Help", "Quit"] {
+            assert!(text.contains(label), "{label} missing:\n{text}");
+        }
+    }
+
+    #[test]
+    fn active_filter_keeps_its_clear_label_at_100_cols() {
+        let mut app = sample_app(2);
+        app.filter = "server".into();
+        let mut terminal = Terminal::new(TestBackend::new(100, 34)).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Esc  Clear filter"), "{text}");
+        assert!(text.contains("Add"), "{text}");
+    }
+
+    #[test]
+    fn help_overlay_lists_every_action_key() {
+        let mut app = sample_app(1);
+        app.open_help();
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        for what in [
+            "Bootstrap",
+            "SSH launcher settings",
+            "Duplicate server",
+            "Pin / unpin",
+            "Import from ~/.ssh/config",
+            "Copy the ssh command",
+            "SSH / SFTP / Mosh",
+            "port forwards",
+            "Re-check reachability",
+            "#tag",
+        ] {
+            assert!(text.contains(what), "{what} missing:\n{text}");
+        }
+    }
+
+    #[test]
+    fn rows_show_pin_reachability_and_forwards() {
+        let mut app = sample_app(3);
+        app.config.servers[0].pinned = true;
+        app.reach
+            .insert("server-0.example.com:22".into(), Reach::Up);
+        app.reach
+            .insert("server-1.example.com:22".into(), Reach::Down);
+        let backend = TestBackend::new(100, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("★ server-0"), "{text}");
+        assert!(text.contains("▣ server-1"), "{text}");
+
+        let buffer = terminal.backend().buffer();
+        let dot_color = |row_name: &str| {
+            let y = (0..buffer.area.height)
+                .find(|&y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .contains(row_name)
+                })
+                .unwrap();
+            let x = (0..buffer.area.width)
+                .rev()
+                .find(|&x| ["●", "○", "◆"].contains(&buffer[(x, y)].symbol()))
+                .unwrap();
+            buffer[(x, y)].fg
+        };
+        let t = theme();
+        assert_eq!(dot_color("server-0"), t.green);
+        assert_eq!(dot_color("server-1"), t.warn);
+        assert_eq!(dot_color("server-2"), t.muted);
+    }
+
+    #[test]
+    fn inspector_summarizes_target_jump_and_tags() {
+        let mut server = sample_server("db");
+        server.username = Some("sam".into());
+        server.port = Some(2222);
+        server.jump_host = Some("bastion".into());
+        server.tags = vec!["prod".into(), "eu".into()];
+        assert_eq!(
+            inspector_meta(&server),
+            (
+                "sam@db.example.com:2222".to_string(),
+                Some("via bastion".to_string()),
+                "#prod #eu".to_string()
+            )
+        );
+
+        let mut app = sample_app(0);
+        app.config.add(server);
+        let backend = TestBackend::new(100, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("sam@db.example.com:2222  ·  via bastion  ·  #prod #eu"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn new_dialogs_render_at_every_size() {
+        let mut app = sample_app(3);
+        app.config.servers[0].forwards = vec!["L8080:localhost:80".into(), "D1080".into()];
+        let candidates: Vec<_> = (0..30)
+            .map(|i| sample_server(&format!("imp-{i}")))
+            .collect();
+        let modes = [
+            Mode::Help,
+            Mode::Launch {
+                mode: LaunchMode::Mosh,
+            },
+            Mode::Forwards { cursor: 1 },
+        ];
+        let sizes = [(120, 40), (84, 24), (60, 18), (40, 12), (20, 8), (5, 3)];
+        for mode in modes {
+            app.mode = mode;
+            for (w, h) in sizes {
+                let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+                terminal.draw(|f| render(f, &app)).unwrap();
+            }
+        }
+        app.mode = Mode::Normal;
+        app.open_import_with(candidates);
+        if let Mode::Import { cursor, .. } = &mut app.mode {
+            *cursor = 29;
+        }
+        for (w, h) in sizes {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| render(f, &app)).unwrap();
+        }
+        // The cursor row scrolls into view on a normal-sized terminal.
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        assert!(buffer_text(&terminal).contains("imp-29"));
     }
 
     #[test]

@@ -1,10 +1,15 @@
 //! Application state and key handling. Rendering lives in [`crate::ui`];
 //! persistence in [`crate::config`]; the ssh handoff in [`crate::ssh`].
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::config::{Config, Server, SshLauncher};
+use crate::forwards::{ForwardKey, Forwards};
+use crate::probe::{probe_key, Prober, Reach};
+use crate::ssh::{ForwardSpec, LaunchMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -14,18 +19,24 @@ pub enum Field {
     Port,
     Username,
     IdentityFile,
+    JumpHost,
     ExtraArgs,
+    Tags,
+    Forwards,
 }
 
 impl Field {
-    pub const ALL: [Field; 7] = [
+    pub const ALL: [Field; 10] = [
         Field::Name,
         Field::Description,
         Field::Host,
         Field::Port,
         Field::Username,
         Field::IdentityFile,
+        Field::JumpHost,
         Field::ExtraArgs,
+        Field::Tags,
+        Field::Forwards,
     ];
 
     pub fn label(self) -> &'static str {
@@ -36,7 +47,10 @@ impl Field {
             Field::Port => "Port (optional)",
             Field::Username => "Username (optional)",
             Field::IdentityFile => "SSH key path (optional)",
+            Field::JumpHost => "Jump host (name or host)",
             Field::ExtraArgs => "Extra ssh args (optional)",
+            Field::Tags => "Tags (space separated)",
+            Field::Forwards => "Forwards (L/R/D specs)",
         }
     }
 
@@ -73,7 +87,10 @@ pub struct DraftServer {
     pub port: String,
     pub username: String,
     pub identity_file: String,
+    pub jump_host: String,
     pub extra_args: String,
+    pub tags: String,
+    pub forwards: String,
 }
 
 impl DraftServer {
@@ -85,8 +102,23 @@ impl DraftServer {
             port: server.port.map(|p| p.to_string()).unwrap_or_default(),
             username: server.username.clone().unwrap_or_default(),
             identity_file: server.identity_file.clone().unwrap_or_default(),
+            jump_host: server.jump_host.clone().unwrap_or_default(),
             extra_args: server.extra_args.clone().unwrap_or_default(),
+            tags: server.tags.join(" "),
+            forwards: server.forwards.join(", "),
         }
+    }
+
+    /// A draft for a new entry copied from `server`, with a fresh name so
+    /// it never collides with the original.
+    pub fn duplicate_of(server: &Server, taken: impl Fn(&str) -> bool) -> Self {
+        let mut draft = Self::from_server(server);
+        let base = format!("{}-copy", server.name);
+        draft.name = std::iter::once(base.clone())
+            .chain((2..).map(|n| format!("{base}-{n}")))
+            .find(|name| !taken(name))
+            .unwrap_or(base);
+        draft
     }
 
     pub fn current_value_mut(&mut self, field: Field) -> &mut String {
@@ -97,7 +129,10 @@ impl DraftServer {
             Field::Port => &mut self.port,
             Field::Username => &mut self.username,
             Field::IdentityFile => &mut self.identity_file,
+            Field::JumpHost => &mut self.jump_host,
             Field::ExtraArgs => &mut self.extra_args,
+            Field::Tags => &mut self.tags,
+            Field::Forwards => &mut self.forwards,
         }
     }
 
@@ -109,7 +144,10 @@ impl DraftServer {
             Field::Port => &self.port,
             Field::Username => &self.username,
             Field::IdentityFile => &self.identity_file,
+            Field::JumpHost => &self.jump_host,
             Field::ExtraArgs => &self.extra_args,
+            Field::Tags => &self.tags,
+            Field::Forwards => &self.forwards,
         }
     }
 
@@ -132,6 +170,38 @@ impl DraftServer {
             ),
         };
 
+        // The host, user, and jump host all end up as ssh destinations; a
+        // leading '-' would let one be parsed as an ssh option instead.
+        let jump_host = optional_trimmed(&self.jump_host);
+        if host.starts_with('-')
+            || self.username.trim().starts_with('-')
+            || jump_host.as_deref().is_some_and(|j| j.starts_with('-'))
+        {
+            return Err("Host, username, and jump host must not start with '-'");
+        }
+        if jump_host
+            .as_deref()
+            .is_some_and(|j| j.contains(char::is_whitespace))
+        {
+            return Err("Jump host must not contain spaces");
+        }
+        if jump_host
+            .as_deref()
+            .is_some_and(|j| j.eq_ignore_ascii_case(name))
+        {
+            return Err("A server cannot be its own jump host");
+        }
+
+        let mut forwards: Vec<String> = Vec::new();
+        for raw in self.forwards.split(',').filter(|f| !f.trim().is_empty()) {
+            let canonical = ForwardSpec::parse(raw)
+                .map_err(|_| "Forwards look like L8080:localhost:80, R9000:host:22, or D1080")?
+                .canonical();
+            if !forwards.contains(&canonical) {
+                forwards.push(canonical);
+            }
+        }
+
         Ok(Server {
             name: name.to_string(),
             description: self.description.trim().to_string(),
@@ -140,7 +210,10 @@ impl DraftServer {
             username: optional_trimmed(&self.username),
             identity_file: optional_trimmed(&self.identity_file),
             extra_args: optional_trimmed(&self.extra_args),
-            last_connected_at: None,
+            jump_host,
+            tags: parse_tags(&self.tags),
+            forwards,
+            ..Default::default()
         })
     }
 
@@ -154,13 +227,24 @@ impl DraftServer {
         if server.identity_file.is_none() {
             return Err("SSH key path is required for bootstrap");
         }
-        // The host and user become the `user@host` ssh destination; a
-        // leading '-' would let it be parsed as an ssh option instead.
-        if server.host.starts_with('-') || server.username.as_deref().unwrap().starts_with('-') {
-            return Err("Host and username must not start with '-'");
-        }
         Ok(server)
     }
+}
+
+/// Splits on spaces and commas, drops `#` prefixes, and removes duplicates
+/// (ignoring case, first spelling wins).
+pub fn parse_tags(raw: &str) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    for tag in raw
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(|t| t.trim_start_matches('#'))
+        .filter(|t| !t.is_empty())
+    {
+        if !tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+            tags.push(tag.to_string());
+        }
+    }
+    tags
 }
 
 fn optional_trimmed(value: &str) -> Option<String> {
@@ -190,7 +274,7 @@ pub enum Mode {
     Search,
     /// The add/edit/bootstrap dialog.
     Form {
-        draft: DraftServer,
+        draft: Box<DraftServer>,
         field: Field,
         purpose: FormPurpose,
     },
@@ -202,6 +286,30 @@ pub enum Mode {
     Settings {
         launcher: SshLauncher,
     },
+    /// The key reference overlay.
+    Help,
+    /// Picking which `~/.ssh/config` hosts to import.
+    Import {
+        candidates: Vec<ImportCandidate>,
+        cursor: usize,
+    },
+    /// Picking SSH, SFTP, or mosh for the selected server.
+    Launch {
+        mode: LaunchMode,
+    },
+    /// Starting and stopping the selected server's saved port forwards.
+    Forwards {
+        cursor: usize,
+    },
+}
+
+/// One importable host in the import dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportCandidate {
+    pub server: Server,
+    /// Already saved under this name; shown but never imported.
+    pub exists: bool,
+    pub chosen: bool,
 }
 
 /// How a status message should be rendered: `Hint` shows the contextual
@@ -217,10 +325,11 @@ pub enum StatusKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppExit {
     Quit,
-    Connect,
+    /// Open the selected server in this mode.
+    Connect(LaunchMode),
     /// Leave the TUI and install this (not yet saved) server's public key on
     /// the remote host; the user is asked afterwards whether to save it.
-    Bootstrap(Server),
+    Bootstrap(Box<Server>),
 }
 
 #[derive(Debug)]
@@ -232,12 +341,17 @@ pub struct App {
     pub status: String,
     pub status_kind: StatusKind,
     pub tick: u64,
+    /// Latest reachability per `host:port`, see [`crate::probe`].
+    pub reach: HashMap<String, Reach>,
+    pub prober: Prober,
+    /// Running port forwards; they live exactly as long as the app.
+    pub forwards: Forwards,
 }
 
 impl App {
     pub fn new(mut config: Config) -> Self {
-        // Most recently connected first, so the last-used server is already
-        // selected on launch.
+        // Pinned first, then most recently connected, so the last-used
+        // server is already selected on launch.
         config.sort_by_recency();
         Self {
             config,
@@ -247,6 +361,34 @@ impl App {
             status: String::new(),
             status_kind: StatusKind::Hint,
             tick: 0,
+            reach: HashMap::new(),
+            prober: Prober::default(),
+            forwards: Forwards::default(),
+        }
+    }
+
+    /// Reachability of `server`, if it has been probed.
+    pub fn reach_of(&self, server: &Server) -> Option<Reach> {
+        self.reach.get(&probe_key(server)).copied()
+    }
+
+    /// Probes every saved server in the background.
+    pub fn refresh_reachability(&mut self) {
+        self.prober.spawn(&self.config.servers, &mut self.reach);
+    }
+
+    /// Per-tick housekeeping: collects finished probes and reports forwards
+    /// that died on their own.
+    pub fn poll_background(&mut self) {
+        self.prober.drain(&mut self.reach);
+        if let Some(dead) = self.forwards.poll().into_iter().next() {
+            self.set_status(
+                StatusKind::Warn,
+                format!(
+                    "Forward {} on {} stopped: {}",
+                    dead.key.spec, dead.key.server, dead.reason
+                ),
+            );
         }
     }
 
@@ -306,7 +448,7 @@ impl App {
 
     pub fn open_add(&mut self) {
         self.mode = Mode::Form {
-            draft: DraftServer::default(),
+            draft: Box::default(),
             field: Field::Name,
             purpose: FormPurpose::Add,
         };
@@ -320,16 +462,209 @@ impl App {
         };
         let draft = DraftServer::from_server(server);
         self.mode = Mode::Form {
-            draft,
+            draft: Box::new(draft),
             field: Field::Name,
             purpose: FormPurpose::Edit(self.selected),
         };
         self.status_kind = StatusKind::Hint;
     }
 
+    /// Opens the add form prefilled from the selected server.
+    pub fn open_duplicate(&mut self) {
+        let Some(server) = self.selected_server() else {
+            self.set_status(StatusKind::Warn, "No server to duplicate");
+            return;
+        };
+        let draft =
+            DraftServer::duplicate_of(server, |name| self.config.index_of_name(name).is_some());
+        self.mode = Mode::Form {
+            draft: Box::new(draft),
+            field: Field::Name,
+            purpose: FormPurpose::Add,
+        };
+        self.status_kind = StatusKind::Hint;
+    }
+
+    pub fn open_help(&mut self) {
+        self.mode = Mode::Help;
+        self.status_kind = StatusKind::Hint;
+    }
+
+    pub fn open_launch(&mut self) {
+        if self.selected_server().is_none() {
+            self.set_status(StatusKind::Warn, "No server selected");
+            return;
+        }
+        self.mode = Mode::Launch {
+            mode: LaunchMode::Ssh,
+        };
+        self.status_kind = StatusKind::Hint;
+    }
+
+    pub fn open_forwards(&mut self) {
+        match self.selected_server() {
+            None => self.set_status(StatusKind::Warn, "No server selected"),
+            Some(server) if server.forwards.is_empty() => self.set_status(
+                StatusKind::Info,
+                "No saved forwards; add some with E → Forwards (e.g. L8080:localhost:80)",
+            ),
+            Some(_) => {
+                self.mode = Mode::Forwards { cursor: 0 };
+                self.status_kind = StatusKind::Hint;
+            }
+        }
+    }
+
+    /// Starts or stops forward `cursor` of the selected server.
+    pub fn toggle_forward(&mut self, cursor: usize) {
+        let Some(server) = self.selected_server().cloned() else {
+            return;
+        };
+        let Some(raw) = server.forwards.get(cursor) else {
+            return;
+        };
+        let key = ForwardKey::new(&server.name, raw);
+        if self.forwards.stop(&key) {
+            self.set_status(StatusKind::Info, format!("Stopped {raw}"));
+            return;
+        }
+        let started = ForwardSpec::parse(raw)
+            .map_err(anyhow::Error::msg)
+            .and_then(|spec| {
+                let resolved = self.config.resolved(&server)?;
+                self.forwards
+                    .start(key, crate::ssh::build_forward_command(&resolved, &spec))
+            });
+        match started {
+            Ok(()) => self.set_status(StatusKind::Success, format!("Started {raw}")),
+            Err(err) => self.set_status(StatusKind::Warn, format!("Forward failed: {err}")),
+        }
+    }
+
+    /// Toggles the pin on the selected server, re-sorts, and keeps it
+    /// selected at its new position.
+    pub fn toggle_pin(&mut self) -> Result<()> {
+        self.toggle_pin_with(Config::save)
+    }
+
+    fn toggle_pin_with(&mut self, save: impl FnOnce(&Config) -> Result<()>) -> Result<()> {
+        if self.selected_server().is_none() {
+            self.set_status(StatusKind::Warn, "No server to pin");
+            return Ok(());
+        }
+        let Some(pinned) = self.config.toggle_pin(self.selected) else {
+            return Ok(());
+        };
+        let name = self.config.servers[self.selected].name.clone();
+        self.config.sort_by_recency();
+        self.selected = self.config.index_of_name(&name).unwrap_or(0);
+        save(&self.config)?;
+        let verb = if pinned { "Pinned" } else { "Unpinned" };
+        self.set_status(StatusKind::Success, format!("{verb} {name}"));
+        Ok(())
+    }
+
+    /// The plain OpenSSH command line for the selected server.
+    pub fn selected_command_line(&self) -> Option<Result<String>> {
+        let server = self.selected_server()?;
+        Some(
+            self.config
+                .resolved(server)
+                .map(|resolved| crate::ssh::command_line(&crate::ssh::build_command(&resolved))),
+        )
+    }
+
+    pub fn copy_command(&mut self) {
+        self.copy_command_with(crate::clipboard::copy);
+    }
+
+    fn copy_command_with(&mut self, copy: impl FnOnce(&str) -> Result<&'static str>) {
+        match self.selected_command_line() {
+            None => self.set_status(StatusKind::Warn, "No server selected"),
+            Some(Err(err)) => self.set_status(StatusKind::Warn, err.to_string()),
+            Some(Ok(line)) => match copy(&line) {
+                Ok(via) => self.set_status(StatusKind::Success, format!("Copied to {via}: {line}")),
+                Err(err) => self.set_status(StatusKind::Warn, format!("Copy failed: {err}")),
+            },
+        }
+    }
+
+    /// Opens the import dialog from `~/.ssh/config`.
+    pub fn open_import(&mut self) {
+        let Some(path) = crate::sshconfig::default_path() else {
+            self.set_status(StatusKind::Warn, "Could not find a home directory");
+            return;
+        };
+        if !path.exists() {
+            self.set_status(
+                StatusKind::Warn,
+                format!("No ssh config at {}", path.display()),
+            );
+            return;
+        }
+        match crate::sshconfig::load(&path) {
+            Ok(servers) => self.open_import_with(servers),
+            Err(err) => self.set_status(StatusKind::Warn, err.to_string()),
+        }
+    }
+
+    pub fn open_import_with(&mut self, servers: Vec<Server>) {
+        let mut seen: Vec<String> = Vec::new();
+        let candidates: Vec<ImportCandidate> = servers
+            .into_iter()
+            .filter(|server| {
+                let key = server.name.to_lowercase();
+                let fresh = !seen.contains(&key);
+                seen.push(key);
+                fresh
+            })
+            .map(|server| {
+                let exists = self.config.index_of_name(&server.name).is_some();
+                ImportCandidate {
+                    server,
+                    exists,
+                    chosen: !exists,
+                }
+            })
+            .collect();
+        if candidates.is_empty() {
+            self.set_status(StatusKind::Info, "No concrete Host entries in ssh config");
+            return;
+        }
+        self.mode = Mode::Import {
+            candidates,
+            cursor: 0,
+        };
+        self.status_kind = StatusKind::Hint;
+    }
+
+    /// Imports the chosen candidates and saves.
+    fn commit_import_with(&mut self, save: impl FnOnce(&Config) -> Result<()>) -> Result<()> {
+        let Mode::Import { candidates, .. } = std::mem::replace(&mut self.mode, Mode::Normal)
+        else {
+            return Ok(());
+        };
+        let chosen: Vec<Server> = candidates
+            .into_iter()
+            .filter(|c| c.chosen && !c.exists)
+            .map(|c| c.server)
+            .collect();
+        let added = self.config.import(chosen);
+        if added == 0 {
+            self.set_status(StatusKind::Info, "Nothing imported");
+            return Ok(());
+        }
+        save(&self.config)?;
+        self.ensure_selection_visible();
+        self.refresh_reachability();
+        let s = if added == 1 { "" } else { "s" };
+        self.set_status(StatusKind::Success, format!("Imported {added} server{s}"));
+        Ok(())
+    }
+
     pub fn open_bootstrap(&mut self) {
         self.mode = Mode::Form {
-            draft: DraftServer::default(),
+            draft: Box::default(),
             field: Field::Name,
             purpose: FormPurpose::Bootstrap,
         };
@@ -409,6 +744,9 @@ impl App {
             return Ok(());
         }
         let removed = self.config.remove(self.selected);
+        if let Some(server) = &removed {
+            self.forwards.stop_for(&server.name);
+        }
 
         if self.selected >= self.config.servers.len() {
             self.selected = self.config.servers.len().saturating_sub(1);
@@ -435,7 +773,7 @@ impl App {
             return match draft.to_bootstrap_server() {
                 Ok(server) => {
                     self.mode = Mode::Normal;
-                    Ok(Some(AppExit::Bootstrap(server)))
+                    Ok(Some(AppExit::Bootstrap(Box::new(server))))
                 }
                 // Keep the dialog open so the input can be corrected.
                 Err(reason) => {
@@ -478,6 +816,7 @@ impl App {
                 }
                 self.ensure_selection_visible();
                 save(&self.config)?;
+                self.refresh_reachability();
             }
             // Keep the dialog open so the input can be corrected.
             Err(reason) => self.set_status(StatusKind::Warn, reason),
@@ -487,15 +826,24 @@ impl App {
     }
 }
 
-/// Matches name, host, or description without case sensitivity.
+/// Every whitespace-separated term must match, ignoring case. `#term`
+/// matches the start of a tag; a bare `#` matches tagged servers; any other
+/// term is a substring of the name, host, description, or a tag.
 pub fn matches_filter(server: &Server, query: &str) -> bool {
-    if query.trim().is_empty() {
-        return true;
-    }
-    let query = query.to_lowercase();
-    [&server.name, &server.host, &server.description]
-        .iter()
-        .any(|value| value.to_lowercase().contains(&query))
+    query.split_whitespace().all(|term| {
+        if let Some(tag) = term.strip_prefix('#') {
+            return if tag.is_empty() {
+                !server.tags.is_empty()
+            } else {
+                server.has_tag_prefix(tag)
+            };
+        }
+        let term = term.to_lowercase();
+        [&server.name, &server.host, &server.description]
+            .into_iter()
+            .chain(server.tags.iter())
+            .any(|value| value.to_lowercase().contains(&term))
+    })
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<Option<AppExit>> {
@@ -515,6 +863,8 @@ fn handle_key_with_settings_commit(
         return Ok(Some(AppExit::Quit));
     }
 
+    let forward_count = app.selected_server().map_or(0, |s| s.forwards.len());
+
     match &mut app.mode {
         Mode::Normal => match key.code {
             KeyCode::Char('/') => {
@@ -529,6 +879,42 @@ fn handle_key_with_settings_commit(
                 Ok(None)
             }
             KeyCode::Char('q' | 'Q') | KeyCode::Esc => Ok(Some(AppExit::Quit)),
+            KeyCode::Char('?') => {
+                app.open_help();
+                Ok(None)
+            }
+            KeyCode::Char('D') => {
+                app.open_duplicate();
+                Ok(None)
+            }
+            KeyCode::Char('y' | 'Y') => {
+                app.copy_command();
+                Ok(None)
+            }
+            KeyCode::Char('p' | 'P') => {
+                if let Err(err) = app.toggle_pin() {
+                    app.set_status(StatusKind::Warn, format!("Failed to save: {err}"));
+                }
+                Ok(None)
+            }
+            KeyCode::Char('i' | 'I') => {
+                app.open_import();
+                Ok(None)
+            }
+            KeyCode::Char('o' | 'O') => {
+                app.open_launch();
+                Ok(None)
+            }
+            KeyCode::Char('f' | 'F') => {
+                app.open_forwards();
+                Ok(None)
+            }
+            KeyCode::Char('r' | 'R') => {
+                app.reach.clear();
+                app.refresh_reachability();
+                app.set_status(StatusKind::Info, "Checking reachability…");
+                Ok(None)
+            }
             KeyCode::Char('j' | 'J') | KeyCode::Down => {
                 app.select_next();
                 Ok(None)
@@ -545,7 +931,7 @@ fn handle_key_with_settings_commit(
                 app.open_edit();
                 Ok(None)
             }
-            KeyCode::Char('d' | 'D') => {
+            KeyCode::Char('d') => {
                 app.request_delete();
                 Ok(None)
             }
@@ -559,7 +945,7 @@ fn handle_key_with_settings_commit(
             }
             KeyCode::Enter => {
                 if app.selected_server().is_some() {
-                    Ok(Some(AppExit::Connect))
+                    Ok(Some(AppExit::Connect(LaunchMode::Ssh)))
                 } else {
                     app.set_status(StatusKind::Warn, "No server selected");
                     Ok(None)
@@ -638,6 +1024,84 @@ fn handle_key_with_settings_commit(
             }
             _ => Ok(None),
         },
+        Mode::Help => {
+            app.mode = Mode::Normal;
+            Ok(None)
+        }
+        Mode::Launch { mode } => match key.code {
+            KeyCode::Char('j' | 'J') | KeyCode::Down | KeyCode::Tab => {
+                *mode = mode.next();
+                Ok(None)
+            }
+            KeyCode::Char('k' | 'K') | KeyCode::Up | KeyCode::BackTab => {
+                *mode = mode.prev();
+                Ok(None)
+            }
+            KeyCode::Enter => {
+                let chosen = *mode;
+                app.mode = Mode::Normal;
+                Ok(Some(AppExit::Connect(chosen)))
+            }
+            KeyCode::Esc | KeyCode::Char('q' | 'Q') => {
+                app.mode = Mode::Normal;
+                Ok(None)
+            }
+            _ => Ok(None),
+        },
+        Mode::Import { candidates, cursor } => match key.code {
+            KeyCode::Char('j' | 'J') | KeyCode::Down => {
+                *cursor = (*cursor + 1).min(candidates.len().saturating_sub(1));
+                Ok(None)
+            }
+            KeyCode::Char('k' | 'K') | KeyCode::Up => {
+                *cursor = cursor.saturating_sub(1);
+                Ok(None)
+            }
+            KeyCode::Char(' ') => {
+                if let Some(c) = candidates.get_mut(*cursor).filter(|c| !c.exists) {
+                    c.chosen = !c.chosen;
+                }
+                Ok(None)
+            }
+            KeyCode::Char('a' | 'A') => {
+                let all = candidates.iter().filter(|c| !c.exists).all(|c| c.chosen);
+                for c in candidates.iter_mut().filter(|c| !c.exists) {
+                    c.chosen = !all;
+                }
+                Ok(None)
+            }
+            KeyCode::Enter => {
+                if let Err(err) = app.commit_import_with(Config::save) {
+                    app.set_status(StatusKind::Warn, format!("Failed to save: {err}"));
+                }
+                Ok(None)
+            }
+            KeyCode::Esc | KeyCode::Char('q' | 'Q') => {
+                app.mode = Mode::Normal;
+                app.set_status(StatusKind::Info, "Import cancelled");
+                Ok(None)
+            }
+            _ => Ok(None),
+        },
+        Mode::Forwards { cursor } => {
+            match key.code {
+                KeyCode::Char('j' | 'J') | KeyCode::Down => {
+                    *cursor = (*cursor + 1).min(forward_count.saturating_sub(1));
+                }
+                KeyCode::Char('k' | 'K') | KeyCode::Up => {
+                    *cursor = cursor.saturating_sub(1);
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    let index = *cursor;
+                    app.toggle_forward(index);
+                }
+                KeyCode::Esc | KeyCode::Char('q' | 'Q' | 'f' | 'F') => {
+                    app.mode = Mode::Normal;
+                }
+                _ => {}
+            }
+            Ok(None)
+        }
         Mode::ConfirmDelete => match key.code {
             KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
                 app.mode = Mode::Normal;
@@ -667,7 +1131,7 @@ mod tests {
             username: None,
             identity_file: None,
             extra_args: None,
-            last_connected_at: None,
+            ..Default::default()
         }
     }
 
@@ -788,6 +1252,265 @@ mod tests {
         assert_eq!(app.selected, 3);
     }
 
+    fn key(app: &mut App, code: KeyCode) -> Option<AppExit> {
+        handle_key(app, KeyEvent::from(code)).unwrap()
+    }
+
+    fn valid_draft() -> DraftServer {
+        DraftServer {
+            name: "box".into(),
+            host: "example.com".into(),
+            ..DraftServer::default()
+        }
+    }
+
+    #[test]
+    fn draft_parses_tags_jump_and_forwards() {
+        let draft = DraftServer {
+            tags: "#prod, eu  PROD homelab".into(),
+            jump_host: " bastion ".into(),
+            forwards: "L8080:localhost:80, -D 1080,L8080:localhost:80".into(),
+            ..valid_draft()
+        };
+        let server = draft.to_server().unwrap();
+        assert_eq!(server.tags, ["prod", "eu", "homelab"]);
+        assert_eq!(server.jump_host.as_deref(), Some("bastion"));
+        assert_eq!(server.forwards, ["L8080:localhost:80", "D1080"]);
+
+        // And back: the draft shows what will be saved.
+        let again = DraftServer::from_server(&server);
+        assert_eq!(again.tags, "prod eu homelab");
+        assert_eq!(again.forwards, "L8080:localhost:80, D1080");
+        assert_eq!(again.to_server().unwrap(), server);
+    }
+
+    #[test]
+    fn draft_rejects_unsafe_jump_hosts_and_bad_forwards() {
+        for (jump, forwards) in [
+            ("-oProxyCommand=x", ""),
+            ("a b", ""),
+            ("BOX", ""),
+            ("", "nope"),
+            ("", "L8080:localhost:80, X1"),
+        ] {
+            let draft = DraftServer {
+                jump_host: jump.into(),
+                forwards: forwards.into(),
+                ..valid_draft()
+            };
+            assert!(draft.to_server().is_err(), "{jump:?} {forwards:?}");
+        }
+        let dash_user = DraftServer {
+            username: "-x".into(),
+            ..valid_draft()
+        };
+        assert!(dash_user.to_server().is_err());
+    }
+
+    #[test]
+    fn filter_supports_tags_and_multiple_terms() {
+        let mut server = sample_server("api");
+        server.tags = vec!["prod".into(), "eu-west".into()];
+        assert!(matches_filter(&server, "#prod"));
+        assert!(matches_filter(&server, "#EU"));
+        assert!(matches_filter(&server, "#"));
+        assert!(matches_filter(&server, "api #prod"));
+        assert!(
+            matches_filter(&server, "west"),
+            "plain terms search tags too"
+        );
+        assert!(!matches_filter(&server, "#staging"));
+        assert!(!matches_filter(&server, "api #staging"));
+        assert!(!matches_filter(&sample_server("bare"), "#"));
+    }
+
+    #[test]
+    fn duplicate_opens_an_add_form_with_a_free_name() {
+        let mut app = App::new(Config::default());
+        let mut original = sample_server("node");
+        original.tags = vec!["lab".into()];
+        original.last_connected_at = Some(5);
+        app.config.add(original);
+        app.config.add(sample_server("node-copy"));
+        app.selected = 0;
+
+        key(&mut app, KeyCode::Char('D'));
+        let Mode::Form { draft, purpose, .. } = &app.mode else {
+            panic!("expected form, got {:?}", app.mode);
+        };
+        assert_eq!(*purpose, FormPurpose::Add);
+        assert_eq!(draft.name, "node-copy-2");
+        assert_eq!(draft.tags, "lab");
+        app.save_draft_with(|_| Ok(())).unwrap();
+        let copy = &app.config.servers[2];
+        assert_eq!(copy.last_connected_at, None, "copies start fresh");
+        assert_eq!(app.config.servers.len(), 3);
+    }
+
+    #[test]
+    fn lowercase_d_still_deletes() {
+        let mut app = App::new(Config::default());
+        app.config.add(sample_server("a"));
+        key(&mut app, KeyCode::Char('d'));
+        assert!(matches!(app.mode, Mode::ConfirmDelete));
+    }
+
+    #[test]
+    fn pin_moves_the_server_up_and_keeps_it_selected() {
+        let mut app = App::new(Config::default());
+        for name in ["a", "b", "c"] {
+            app.config.add(sample_server(name));
+        }
+        app.selected = 2;
+        let mut saved = None;
+        app.toggle_pin_with(|c| {
+            saved = Some(c.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(app.config.servers[0].name, "c");
+        assert_eq!(app.selected, 0);
+        assert!(saved.unwrap().servers[0].pinned);
+        assert_eq!(app.status, "Pinned c");
+
+        app.toggle_pin_with(|_| Ok(())).unwrap();
+        assert!(!app.config.servers[app.selected].pinned);
+        assert_eq!(app.config.servers[app.selected].name, "c");
+    }
+
+    #[test]
+    fn copy_command_reports_the_exact_line() {
+        let mut app = App::new(Config::default());
+        let mut bastion = sample_server("bastion");
+        bastion.host = "b.example".into();
+        let mut server = sample_server("db");
+        server.username = Some("sam".into());
+        server.port = Some(2222);
+        server.jump_host = Some("bastion".into());
+        app.config.add(server);
+        app.config.add(bastion);
+        app.selected = 0;
+
+        let mut copied = String::new();
+        app.copy_command_with(|line| {
+            copied = line.to_string();
+            Ok("clipboard")
+        });
+        assert_eq!(copied, "ssh -p 2222 -J b.example sam@example.com");
+        assert_eq!(app.status_kind, StatusKind::Success);
+
+        app.copy_command_with(|_| anyhow::bail!("no display"));
+        assert_eq!(app.status_kind, StatusKind::Warn);
+        assert!(app.status.contains("no display"));
+    }
+
+    #[test]
+    fn import_dialog_preselects_new_hosts_and_skips_existing() {
+        let mut app = App::new(Config::default());
+        app.config.add(sample_server("node-2"));
+        app.open_import_with(vec![
+            sample_server("node-2"),
+            sample_server("gitea"),
+            sample_server("GITEA"),
+            sample_server("nas"),
+        ]);
+        let Mode::Import { candidates, .. } = &app.mode else {
+            panic!("expected import mode");
+        };
+        let shape: Vec<_> = candidates
+            .iter()
+            .map(|c| (c.server.name.as_str(), c.exists, c.chosen))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("node-2", true, false),
+                ("gitea", false, true),
+                ("nas", false, true)
+            ]
+        );
+
+        // Space on an existing row does nothing; untick `nas`.
+        key(&mut app, KeyCode::Char(' '));
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Char(' '));
+        let mut saves = 0;
+        app.commit_import_with(|_| {
+            saves += 1;
+            Ok(())
+        })
+        .unwrap();
+        let names: Vec<_> = app.config.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["node-2", "gitea"]);
+        assert_eq!(saves, 1);
+        assert_eq!(app.status, "Imported 1 server");
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn import_select_all_toggles_and_empty_input_is_reported() {
+        let mut app = App::new(Config::default());
+        app.open_import_with(vec![]);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.status_kind, StatusKind::Info);
+
+        app.open_import_with(vec![sample_server("a"), sample_server("b")]);
+        key(&mut app, KeyCode::Char('a'));
+        let Mode::Import { candidates, .. } = &app.mode else {
+            panic!()
+        };
+        assert!(candidates.iter().all(|c| !c.chosen));
+        key(&mut app, KeyCode::Esc);
+        assert!(app.config.servers.is_empty());
+    }
+
+    #[test]
+    fn launch_dialog_returns_the_chosen_mode() {
+        let mut app = App::new(Config::default());
+        app.config.add(sample_server("a"));
+        assert_eq!(
+            key(&mut app, KeyCode::Enter),
+            Some(AppExit::Connect(LaunchMode::Ssh))
+        );
+        key(&mut app, KeyCode::Char('o'));
+        key(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            key(&mut app, KeyCode::Enter),
+            Some(AppExit::Connect(LaunchMode::Sftp))
+        );
+        key(&mut app, KeyCode::Char('o'));
+        assert_eq!(key(&mut app, KeyCode::Esc), None);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn help_opens_with_question_mark_and_any_key_closes() {
+        let mut app = App::new(Config::default());
+        key(&mut app, KeyCode::Char('?'));
+        assert!(matches!(app.mode, Mode::Help));
+        // `q` closes the overlay instead of quitting.
+        assert_eq!(key(&mut app, KeyCode::Char('q')), None);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn forwards_dialog_needs_saved_forwards() {
+        let mut app = App::new(Config::default());
+        app.config.add(sample_server("a"));
+        key(&mut app, KeyCode::Char('f'));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.status_kind, StatusKind::Info);
+
+        app.config.servers[0].forwards = vec!["D1080".into(), "L1:h:2".into()];
+        key(&mut app, KeyCode::Char('f'));
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down);
+        assert!(matches!(app.mode, Mode::Forwards { cursor: 1 }));
+        key(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
     #[test]
     fn draft_requires_name_and_host() {
         let draft = DraftServer {
@@ -809,6 +1532,7 @@ mod tests {
             username: " sam ".to_string(),
             identity_file: " ~/.ssh/id_ed25519 ".to_string(),
             extra_args: " -o ServerAliveInterval=30 ".to_string(),
+            ..DraftServer::default()
         };
 
         let server = draft.to_server().unwrap();
@@ -847,7 +1571,7 @@ mod tests {
             username: Some("deploy".to_string()),
             identity_file: None,
             extra_args: Some("-A".to_string()),
-            last_connected_at: None,
+            ..Default::default()
         };
 
         let rebuilt = DraftServer::from_server(&server).to_server().unwrap();
@@ -884,8 +1608,9 @@ mod tests {
     fn field_traversal_clamps_at_both_ends() {
         assert_eq!(Field::Name.prev(), Field::Name);
         assert_eq!(Field::Name.next(), Field::Description);
-        assert_eq!(Field::ExtraArgs.next(), Field::ExtraArgs);
-        assert!(Field::ExtraArgs.is_last());
+        assert_eq!(Field::Forwards.next(), Field::Forwards);
+        assert!(Field::Forwards.is_last());
+        assert!(!Field::ExtraArgs.is_last());
         assert!(!Field::Name.is_last());
     }
 

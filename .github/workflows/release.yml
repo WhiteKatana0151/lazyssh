@@ -1,0 +1,58 @@
+name: Release
+
+# Push a `vX.Y.Z` tag whose version matches Cargo.toml to build, package,
+# checksum, and publish Linux + Windows binaries as a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install mingw for the Windows target
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - run: cargo test
+      - run: cargo build --release --target x86_64-unknown-linux-gnu
+      - run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          L=x86_64-unknown-linux-gnu
+          W=x86_64-pc-windows-gnu
+          mkdir -p dist/pkg/lazyssh-$VERSION-$L dist/pkg/lazyssh-$VERSION-$W
+          cp target/$L/release/lazyssh README.md dist/pkg/lazyssh-$VERSION-$L/
+          cp target/$W/release/lazyssh.exe README.md dist/pkg/lazyssh-$VERSION-$W/
+          (cd dist/pkg && tar -czf ../lazyssh-$VERSION-$L.tar.gz lazyssh-$VERSION-$L \
+                       && zip -qr ../lazyssh-$VERSION-$W.zip lazyssh-$VERSION-$W)
+          cp target/$L/release/lazyssh dist/lazyssh-$VERSION-$L
+          cp target/$W/release/lazyssh.exe dist/lazyssh-$VERSION-$W.exe
+          rm -rf dist/pkg
+          (cd dist && sha256sum lazyssh-* > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "lazyssh $GITHUB_REF_NAME" \
+            --generate-notes

@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// A saved SSH server entry. No secrets are stored, only a path to a key file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Server {
     pub name: String,
     pub description: String,
@@ -23,6 +23,52 @@ pub struct Server {
     /// never connected; `serde(default)` keeps older configs loading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_connected_at: Option<u64>,
+    /// Free-form labels such as `homelab` or `prod`, searchable with `/#tag`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Pinned servers always sort above the recency-ranked rest.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
+    /// ProxyJump hop: either the name of another saved server, which is
+    /// resolved to its `[user@]host[:port]` at connect time, or a literal
+    /// `-J` destination such as `bastion@jump.example.com:2222`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jump_host: Option<String>,
+    /// Saved port forwards in `L8080:localhost:80`, `R9000:localhost:9000`,
+    /// or `D1080` form; started and stopped from the forwards dialog.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<String>,
+}
+
+/// Longest ProxyJump chain followed when resolving saved-server references,
+/// which also stops reference cycles.
+const MAX_JUMP_DEPTH: usize = 8;
+
+impl Server {
+    /// `[user@]host[:port]`, the destination syntax `ssh -J` accepts.
+    pub fn jump_destination(&self) -> String {
+        let mut spec = match &self.username {
+            Some(user) if !user.is_empty() => format!("{user}@{}", self.host),
+            _ => self.host.clone(),
+        };
+        if let Some(port) = self.port {
+            spec.push_str(&format!(":{port}"));
+        }
+        spec
+    }
+
+    /// Port used to reach the server directly.
+    pub fn effective_port(&self) -> u16 {
+        self.port.unwrap_or(22)
+    }
+
+    /// Whether any tag starts with `prefix`, ignoring case.
+    pub fn has_tag_prefix(&self, prefix: &str) -> bool {
+        let prefix = prefix.to_lowercase();
+        self.tags
+            .iter()
+            .any(|tag| tag.to_lowercase().starts_with(&prefix))
+    }
 }
 
 /// Current Unix time in seconds, or 0 if the clock is before the epoch.
@@ -153,11 +199,12 @@ impl Config {
         }
     }
 
-    /// Replaces the server at `index` while keeping its connection history,
-    /// so editing an entry never resets its recency.
+    /// Replaces the server at `index` while keeping its connection history
+    /// and pin, so editing an entry never resets how it ranks.
     pub fn update_preserving_recency(&mut self, index: usize, mut server: Server) -> bool {
         if let Some(existing) = self.servers.get(index) {
             server.last_connected_at = existing.last_connected_at;
+            server.pinned = existing.pinned;
         }
         self.update(index, server)
     }
@@ -174,11 +221,89 @@ impl Config {
         }
     }
 
-    /// Orders servers most recently connected first. Never-connected servers
-    /// follow the connected ones, keeping their existing relative order.
+    /// Orders pinned servers first, then most recently connected first.
+    /// Never-connected servers follow the connected ones within each group,
+    /// keeping their existing relative order (the sort is stable).
     pub fn sort_by_recency(&mut self) {
+        self.servers.sort_by_key(|server| {
+            (
+                std::cmp::Reverse(server.pinned),
+                std::cmp::Reverse(server.last_connected_at),
+            )
+        });
+    }
+
+    /// Flips the pin on the server at `index`, returning the new state.
+    pub fn toggle_pin(&mut self, index: usize) -> Option<bool> {
+        let server = self.servers.get_mut(index)?;
+        server.pinned = !server.pinned;
+        Some(server.pinned)
+    }
+
+    /// Exact (case-insensitive) name lookup.
+    pub fn index_of_name(&self, name: &str) -> Option<usize> {
         self.servers
-            .sort_by_key(|server| std::cmp::Reverse(server.last_connected_at));
+            .iter()
+            .position(|server| server.name.eq_ignore_ascii_case(name))
+    }
+
+    /// A copy of `server` ready to hand to ssh: its jump host, if it names
+    /// saved servers, is replaced by the resolved `-J` chain.
+    pub fn resolved(&self, server: &Server) -> Result<Server> {
+        let mut out = server.clone();
+        out.jump_host = self.resolve_jump(server)?;
+        Ok(out)
+    }
+
+    /// Adds every server whose name is not already taken (ignoring case),
+    /// returning how many were added. Names are also deduplicated within
+    /// `incoming` itself, first one wins.
+    pub fn import(&mut self, incoming: Vec<Server>) -> usize {
+        let mut added = 0;
+        for server in incoming {
+            if self.index_of_name(&server.name).is_none() {
+                self.add(server);
+                added += 1;
+            }
+        }
+        added
+    }
+
+    /// Resolves `server`'s jump host into a `-J` argument. A value naming a
+    /// saved server becomes that server's destination, following its own jump
+    /// host first so chains become `hop1,hop2`; anything else is passed on
+    /// verbatim. Cycles and overly deep chains are an error.
+    pub fn resolve_jump(&self, server: &Server) -> Result<Option<String>> {
+        let mut hops = Vec::new();
+        let mut current = match server.jump_host.as_deref().map(str::trim) {
+            Some(jump) if !jump.is_empty() => jump.to_string(),
+            _ => return Ok(None),
+        };
+        let mut seen = vec![server.name.to_lowercase()];
+        loop {
+            let Some(index) = self.index_of_name(&current) else {
+                hops.push(current);
+                break;
+            };
+            let hop = &self.servers[index];
+            let key = hop.name.to_lowercase();
+            if seen.contains(&key) || hops.len() >= MAX_JUMP_DEPTH {
+                anyhow::bail!(
+                    "jump host chain through `{}` loops or is too deep",
+                    hop.name
+                );
+            }
+            seen.push(key);
+            hops.push(hop.jump_destination());
+            match hop.jump_host.as_deref().map(str::trim) {
+                Some(next) if !next.is_empty() => current = next.to_string(),
+                _ => break,
+            }
+        }
+        // `-J a,b` connects through a first: the outermost hop is the one
+        // found last while walking inward from the target.
+        hops.reverse();
+        Ok(Some(hops.join(",")))
     }
 
     pub fn remove(&mut self, index: usize) -> Option<Server> {
@@ -203,8 +328,134 @@ mod tests {
             username: Some("root".to_string()),
             identity_file: Some("/home/user/.ssh/id_ed25519".to_string()),
             extra_args: Some("-o ServerAliveInterval=30".to_string()),
-            last_connected_at: None,
+            ..Default::default()
         }
+    }
+
+    fn named(name: &str, host: &str) -> Server {
+        Server {
+            name: name.into(),
+            host: host.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn new_fields_round_trip_and_stay_out_of_old_shape_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("servers.json");
+
+        let mut config = Config::default();
+        config.add(sample_server("plain"));
+        let mut rich = sample_server("rich");
+        rich.tags = vec!["prod".into(), "eu".into()];
+        rich.pinned = true;
+        rich.jump_host = Some("bastion".into());
+        rich.forwards = vec!["L8080:localhost:80".into()];
+        config.add(rich);
+        config.save_to(&path).unwrap();
+
+        assert_eq!(Config::load_from(&path).unwrap(), config);
+        let raw = fs::read_to_string(&path).unwrap();
+        // Defaults are skipped, so untouched entries keep their old shape.
+        assert_eq!(raw.matches("\"pinned\"").count(), 1);
+        assert_eq!(raw.matches("\"tags\"").count(), 1);
+    }
+
+    #[test]
+    fn pinned_sort_above_recency() {
+        let mut config = Config::default();
+        for name in ["a", "b", "c", "d"] {
+            config.add(sample_server(name));
+        }
+        config.mark_connected(0, 300);
+        config.mark_connected(1, 100);
+        assert_eq!(config.toggle_pin(2), Some(true));
+        config.sort_by_recency();
+        let names: Vec<_> = config.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["c", "a", "b", "d"]);
+        assert_eq!(config.toggle_pin(0), Some(false));
+        assert_eq!(config.toggle_pin(9), None);
+    }
+
+    #[test]
+    fn jump_resolves_saved_names_into_chains_and_passes_literals_through() {
+        let mut config = Config::default();
+        let mut outer = named("edge", "edge.example.com");
+        outer.username = Some("ops".into());
+        outer.port = Some(2222);
+        let mut inner = named("bastion", "10.0.0.1");
+        inner.jump_host = Some("EDGE".into());
+        let mut target = named("db", "10.0.0.5");
+        target.jump_host = Some("bastion".into());
+        config.add(outer);
+        config.add(inner);
+        config.add(target.clone());
+
+        assert_eq!(
+            config.resolve_jump(&target).unwrap().as_deref(),
+            Some("ops@edge.example.com:2222,10.0.0.1")
+        );
+
+        target.jump_host = Some("me@literal:22".into());
+        assert_eq!(
+            config.resolve_jump(&target).unwrap().as_deref(),
+            Some("me@literal:22")
+        );
+
+        target.jump_host = Some("   ".into());
+        assert_eq!(config.resolve_jump(&target).unwrap(), None);
+    }
+
+    #[test]
+    fn import_skips_taken_names_case_insensitively() {
+        let mut config = Config::default();
+        config.add(named("Node-2", "old"));
+        let added = config.import(vec![
+            named("node-2", "new"),
+            named("gitea", "g"),
+            named("GITEA", "dupe"),
+        ]);
+        assert_eq!(added, 1);
+        let hosts: Vec<_> = config.servers.iter().map(|s| s.host.as_str()).collect();
+        assert_eq!(hosts, ["old", "g"]);
+    }
+
+    #[test]
+    fn edits_keep_the_pin() {
+        let mut config = Config::default();
+        config.add(named("a", "h"));
+        config.toggle_pin(0);
+        config.update_preserving_recency(0, named("a2", "h"));
+        assert!(config.servers[0].pinned);
+    }
+
+    #[test]
+    fn resolved_rewrites_only_the_jump_host() {
+        let mut config = Config::default();
+        config.add(named("bastion", "b.example"));
+        let mut target = named("db", "10.0.0.5");
+        target.jump_host = Some("bastion".into());
+        let resolved = config.resolved(&target).unwrap();
+        assert_eq!(resolved.jump_host.as_deref(), Some("b.example"));
+        assert_eq!(resolved.host, target.host);
+    }
+
+    #[test]
+    fn jump_cycles_are_rejected() {
+        let mut config = Config::default();
+        let mut a = named("a", "a.example");
+        a.jump_host = Some("b".into());
+        let mut b = named("b", "b.example");
+        b.jump_host = Some("a".into());
+        config.add(a.clone());
+        config.add(b);
+        assert!(config.resolve_jump(&a).is_err());
+
+        let mut selfish = named("self", "s.example");
+        selfish.jump_host = Some("self".into());
+        config.add(selfish.clone());
+        assert!(config.resolve_jump(&selfish).is_err());
     }
 
     #[test]
