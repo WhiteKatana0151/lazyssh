@@ -128,20 +128,14 @@ mod tests {
     fn probes_open_and_closed_ports_and_skips_jumped_servers() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let open = listener.local_addr().unwrap().port();
-        // Bind then drop to get a port that is very likely closed.
-        let closed = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // RFC 6761 reserves `.invalid`, so this can never resolve. A port
+        // freed by dropping a listener is not reliably closed: tests running
+        // in parallel can be handed the same ephemeral port.
+        let dead = server("never.invalid", 22);
 
         let mut jumped = server("10.9.9.9", 22);
         jumped.jump_host = Some("bastion".into());
-        let servers = [
-            server("127.0.0.1", open),
-            server("127.0.0.1", closed),
-            jumped,
-        ];
+        let servers = [server("127.0.0.1", open), dead, jumped];
 
         let prober = Prober::default();
         let mut state = HashMap::new();
@@ -156,7 +150,7 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(state[&format!("127.0.0.1:{open}")], Reach::Up);
-        assert_eq!(state[&format!("127.0.0.1:{closed}")], Reach::Down);
+        assert_eq!(state["never.invalid:22"], Reach::Down);
         drop(listener);
     }
 
