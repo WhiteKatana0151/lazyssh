@@ -181,9 +181,235 @@ fn push_ssh_options(cmd: &mut Command, server: &Server) {
         cmd.arg("-p").arg(port.to_string());
     }
 
+    if let Some(jump) = jump_arg(server) {
+        cmd.arg("-J").arg(jump);
+    }
+
     if let Some(extra) = &server.extra_args {
         cmd.args(extra.split_whitespace());
     }
+}
+
+/// The `-J` value for `server`. Callers hand in a server from
+/// [`crate::config::Config::resolved`], whose jump host has already been
+/// turned from a saved-server name into a real `[user@]host[:port]` chain.
+fn jump_arg(server: &Server) -> Option<&str> {
+    server
+        .jump_host
+        .as_deref()
+        .map(str::trim)
+        .filter(|jump| !jump.is_empty())
+}
+
+/// How to open a session with a server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMode {
+    /// An interactive shell through the configured launcher.
+    Ssh,
+    /// An interactive `sftp` session.
+    Sftp,
+    /// `mosh`, tunnelling its bootstrap through ssh with the same options.
+    Mosh,
+}
+
+impl LaunchMode {
+    pub const ALL: [LaunchMode; 3] = [LaunchMode::Ssh, LaunchMode::Sftp, LaunchMode::Mosh];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LaunchMode::Ssh => "SSH",
+            LaunchMode::Sftp => "SFTP",
+            LaunchMode::Mosh => "Mosh",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            LaunchMode::Ssh => "Interactive shell via the configured launcher",
+            LaunchMode::Sftp => "File transfer session (sftp)",
+            LaunchMode::Mosh => "Roaming, latency-tolerant shell (mosh)",
+        }
+    }
+
+    /// The program this mode needs on `PATH`.
+    pub fn program(self) -> &'static str {
+        match self {
+            LaunchMode::Ssh => "ssh",
+            LaunchMode::Sftp => "sftp",
+            LaunchMode::Mosh => "mosh",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|m| *m == self).unwrap_or(0);
+        Self::ALL[(i + 1).min(Self::ALL.len() - 1)]
+    }
+
+    pub fn prev(self) -> Self {
+        let i = Self::ALL.iter().position(|m| *m == self).unwrap_or(0);
+        Self::ALL[i.saturating_sub(1)]
+    }
+}
+
+/// Only `-o Key=value` options survive from extra args when the command is
+/// not `ssh` itself: flags such as `-A` or `-t` mean something else (or
+/// nothing) to `sftp`, while `-o` is understood by both.
+fn ssh_o_options(extra: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut tokens = extra.unwrap_or_default().split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "-o" {
+            if let Some(value) = tokens.next() {
+                out.push("-o".to_string());
+                out.push(value.to_string());
+            }
+        } else if token.starts_with("-o") {
+            out.push(token.to_string());
+        }
+    }
+    out
+}
+
+/// `sftp` to `server`. sftp spells the port flag `-P`.
+pub fn build_sftp_command(server: &Server) -> Command {
+    let mut cmd = Command::new("sftp");
+    if let Some(identity) = server.identity_file.as_deref().filter(|i| !i.is_empty()) {
+        cmd.arg("-i").arg(identity);
+    }
+    if let Some(port) = server.port {
+        cmd.arg("-P").arg(port.to_string());
+    }
+    if let Some(jump) = jump_arg(server) {
+        cmd.arg("-J").arg(jump);
+    }
+    cmd.args(ssh_o_options(server.extra_args.as_deref()));
+    cmd.arg(target(server));
+    cmd
+}
+
+/// `mosh` to `server`. mosh parses `--ssh` with shell-style word
+/// splitting, so every ssh argument is single-quoted into that one value;
+/// no shell is spawned by LazySSH itself.
+pub fn build_mosh_command(server: &Server) -> Command {
+    let mut cmd = Command::new("mosh");
+    let ssh = base_command(server);
+    let options: Vec<String> = ssh
+        .get_args()
+        .map(|arg| shell_quote(&arg.to_string_lossy()))
+        .collect();
+    if !options.is_empty() {
+        cmd.arg(format!("--ssh=ssh {}", options.join(" ")));
+    }
+    // Ends option parsing so the destination is never read as a flag.
+    cmd.arg("--");
+    cmd.arg(target(server));
+    cmd
+}
+
+/// The interactive command for `mode`.
+pub fn build_launch_command(server: &Server, mode: LaunchMode, launcher: Launcher) -> Command {
+    match mode {
+        LaunchMode::Ssh => build_interactive_command(server, launcher),
+        LaunchMode::Sftp => build_sftp_command(server),
+        LaunchMode::Mosh => build_mosh_command(server),
+    }
+}
+
+/// POSIX single-quoting, leaving obviously safe words bare for readability.
+pub fn shell_quote(arg: &str) -> String {
+    let safe = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:@=,+%~".contains(c));
+    if safe {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
+}
+
+/// A copy-pasteable shell rendering of `cmd`.
+pub fn command_line(cmd: &Command) -> String {
+    std::iter::once(cmd.get_program())
+        .chain(cmd.get_args())
+        .map(|part| shell_quote(&part.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A validated, saved port forward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardSpec {
+    /// `'L'`, `'R'`, or `'D'`.
+    pub kind: char,
+    /// What follows the flag, e.g. `8080:localhost:80` or `1080`.
+    pub spec: String,
+}
+
+impl ForwardSpec {
+    /// Parses `L8080:localhost:80`, `-L 8080:localhost:80`, `r9000:host:22`,
+    /// or `D1080` into a forward.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let raw = raw.trim();
+        let body = raw.strip_prefix('-').unwrap_or(raw);
+        let mut chars = body.chars();
+        let kind = chars
+            .next()
+            .map(|c| c.to_ascii_uppercase())
+            .filter(|c| matches!(c, 'L' | 'R' | 'D'))
+            .ok_or_else(|| format!("Forward `{raw}` must start with L, R, or D"))?;
+        let spec = chars.as_str().trim();
+        let invalid = || format!("Invalid forward `{raw}`");
+        if spec.is_empty() || spec.starts_with('-') || spec.contains(char::is_whitespace) {
+            return Err(invalid());
+        }
+        let parts: Vec<&str> = spec.split(':').collect();
+        if parts.iter().any(|part| part.is_empty()) {
+            return Err(invalid());
+        }
+        // The listen port is the last part for D and the second-to-last
+        // part is the remote port for L/R; checking every numeric slot keeps
+        // obvious typos out without reimplementing ssh's full grammar.
+        let ok = match kind {
+            'D' => parts.len() <= 2 && parts.last().unwrap().parse::<u16>().is_ok(),
+            _ => {
+                (3..=4).contains(&parts.len())
+                    && parts[parts.len() - 3].parse::<u16>().is_ok()
+                    && parts[parts.len() - 1].parse::<u16>().is_ok()
+            }
+        };
+        if !ok {
+            return Err(invalid());
+        }
+        Ok(Self {
+            kind,
+            spec: spec.to_string(),
+        })
+    }
+
+    /// The canonical saved form, e.g. `L8080:localhost:80`.
+    pub fn canonical(&self) -> String {
+        format!("{}{}", self.kind, self.spec)
+    }
+}
+
+/// A background, non-interactive ssh holding `forward` open. `BatchMode`
+/// guarantees ssh never prompts (which would scribble over the TUI), so
+/// forwards need key or agent authentication; `ExitOnForwardFailure` makes
+/// a busy local port an error instead of a silently useless session.
+pub fn build_forward_command(server: &Server, forward: &ForwardSpec) -> Command {
+    let mut cmd = Command::new("ssh");
+    cmd.args([
+        "-N",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "BatchMode=yes",
+    ]);
+    push_ssh_options(&mut cmd, server);
+    cmd.arg(format!("-{}", forward.kind)).arg(&forward.spec);
+    cmd.arg(target(server));
+    cmd
 }
 
 /// The common `ssh` invocation for `server`: identity, port, and extra args,
@@ -322,21 +548,21 @@ pub fn bootstrap(server: &Server) -> Result<()> {
     Ok(())
 }
 
-/// Connects to `server`, handing control of the terminal to `launcher`.
+/// Hands the terminal to `cmd` and returns its exit code.
 ///
-/// On Unix this replaces the lazyssh process with the launcher. On Windows
-/// there is no direct `exec`, so it starts the launcher and waits for it to
-/// exit.
-#[cfg(unix)]
-pub fn connect(server: &Server, launcher: Launcher) -> std::io::Result<()> {
-    use std::os::unix::process::CommandExt;
-    Err(build_interactive_command(server, launcher).exec())
-}
-
-#[cfg(not(unix))]
-pub fn connect(server: &Server, launcher: Launcher) -> std::io::Result<()> {
-    let status = build_interactive_command(server, launcher).status()?;
-    std::process::exit(status.code().unwrap_or(1));
+/// With `replace` on Unix the lazyssh process becomes `cmd` via `exec`, so
+/// this only returns on failure. Otherwise — on Windows, or when lazyssh
+/// must outlive the session to tear down port forwards — it runs `cmd` as a
+/// child and waits.
+pub fn run_interactive(mut cmd: Command, replace: bool) -> std::io::Result<i32> {
+    #[cfg(unix)]
+    if replace {
+        use std::os::unix::process::CommandExt;
+        return Err(cmd.exec());
+    }
+    let _ = replace;
+    let status = cmd.status()?;
+    Ok(status.code().unwrap_or(1))
 }
 
 #[cfg(test)]
@@ -352,7 +578,7 @@ mod tests {
             username: None,
             identity_file: None,
             extra_args: None,
-            last_connected_at: None,
+            ..Default::default()
         }
     }
 
@@ -684,6 +910,151 @@ mod tests {
 
         assert_eq!(cmd.get_program(), wanted.as_os_str());
         assert_eq!(args(&cmd)[..2], ["+kitten", "ssh"]);
+    }
+
+    #[test]
+    fn jump_host_becomes_a_single_j_argument() {
+        let mut server = base_server();
+        server.jump_host = Some(" ops@edge:2222,10.0.0.1 ".into());
+        assert_eq!(
+            args(&build_command(&server)),
+            ["-J", "ops@edge:2222,10.0.0.1", "example.com"]
+        );
+        server.jump_host = Some("  ".into());
+        assert_eq!(args(&build_command(&server)), ["example.com"]);
+    }
+
+    #[test]
+    fn sftp_uses_capital_p_and_keeps_only_o_options() {
+        let mut server = full_server();
+        server.jump_host = Some("bastion".into());
+        server.extra_args = Some("-A -o ServerAliveInterval=30 -oCompression=yes -t".into());
+        let cmd = build_sftp_command(&server);
+        assert_eq!(cmd.get_program(), "sftp");
+        assert_eq!(
+            args(&cmd),
+            [
+                "-i",
+                "/home/user/.ssh/id_ed25519",
+                "-P",
+                "2222",
+                "-J",
+                "bastion",
+                "-o",
+                "ServerAliveInterval=30",
+                "-oCompression=yes",
+                "deploy@example.com"
+            ]
+        );
+    }
+
+    #[test]
+    fn mosh_quotes_ssh_options_into_one_argument() {
+        let mut server = full_server();
+        server.identity_file = Some("/keys/my key".into());
+        let cmd = build_mosh_command(&server);
+        assert_eq!(cmd.get_program(), "mosh");
+        assert_eq!(
+            args(&cmd),
+            [
+                "--ssh=ssh -i '/keys/my key' -p 2222 -A -o ServerAliveInterval=30",
+                "--",
+                "deploy@example.com"
+            ]
+        );
+        let bare = build_mosh_command(&base_server());
+        assert_eq!(args(&bare), ["--", "example.com"]);
+    }
+
+    #[test]
+    fn launch_mode_picks_the_matching_builder() {
+        let server = base_server();
+        for (mode, program) in [
+            (LaunchMode::Ssh, "ssh"),
+            (LaunchMode::Sftp, "sftp"),
+            (LaunchMode::Mosh, "mosh"),
+        ] {
+            let cmd = build_launch_command(&server, mode, Launcher::OpenSsh);
+            assert_eq!(cmd.get_program(), program);
+            assert_eq!(mode.program(), program);
+        }
+        assert_eq!(LaunchMode::Ssh.prev(), LaunchMode::Ssh);
+        assert_eq!(LaunchMode::Mosh.next(), LaunchMode::Mosh);
+        assert_eq!(LaunchMode::Ssh.next().next(), LaunchMode::Mosh);
+    }
+
+    #[test]
+    fn command_line_is_copy_pasteable() {
+        let mut server = full_server();
+        server.identity_file = Some("~/.ssh/it's".into());
+        assert_eq!(
+            command_line(&build_command(&server)),
+            "ssh -i '~/.ssh/it'\\''s' -p 2222 -A -o ServerAliveInterval=30 deploy@example.com"
+        );
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("$(rm)"), "'$(rm)'");
+    }
+
+    #[test]
+    fn forward_specs_parse_and_canonicalize() {
+        for (raw, kind, spec) in [
+            ("L8080:localhost:80", 'L', "8080:localhost:80"),
+            ("-L 8080:localhost:80", 'L', "8080:localhost:80"),
+            ("l127.0.0.1:8080:db:5432", 'L', "127.0.0.1:8080:db:5432"),
+            ("R9000:localhost:9000", 'R', "9000:localhost:9000"),
+            ("D1080", 'D', "1080"),
+            ("-D 127.0.0.1:1080", 'D', "127.0.0.1:1080"),
+        ] {
+            let parsed = ForwardSpec::parse(raw).unwrap();
+            assert_eq!((parsed.kind, parsed.spec.as_str()), (kind, spec), "{raw}");
+        }
+        assert_eq!(
+            ForwardSpec::parse("-L 8080:localhost:80")
+                .unwrap()
+                .canonical(),
+            "L8080:localhost:80"
+        );
+        for bad in [
+            "",
+            "X8080",
+            "L",
+            "L8080",
+            "Lfoo:localhost:80",
+            "L8080:localhost:http",
+            "L8080::80",
+            "D-oProxyCommand=x",
+            "L8080:a b:80",
+            "Dnope",
+            "D1:2:3",
+        ] {
+            assert!(ForwardSpec::parse(bad).is_err(), "{bad} should fail");
+        }
+    }
+
+    #[test]
+    fn forward_command_is_batch_mode_and_fails_on_busy_ports() {
+        let mut server = full_server();
+        server.jump_host = Some("bastion".into());
+        let forward = ForwardSpec::parse("L8080:localhost:80").unwrap();
+        let cmd = build_forward_command(&server, &forward);
+        let got = args(&cmd);
+        assert_eq!(cmd.get_program(), "ssh");
+        assert_eq!(
+            got[..5],
+            [
+                "-N",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-o",
+                "BatchMode=yes"
+            ]
+        );
+        assert!(got.windows(2).any(|w| w == ["-J", "bastion"]));
+        assert_eq!(
+            got[got.len() - 3..],
+            ["-L", "8080:localhost:80", "deploy@example.com"]
+        );
     }
 
     fn full_server() -> Server {
