@@ -1,4 +1,5 @@
 mod app;
+mod backup;
 mod cli;
 mod clipboard;
 mod config;
@@ -69,11 +70,54 @@ fn run(command: cli::Command) -> Result<u8> {
             println!("{}", ssh::command_line(&ssh::build_command(&resolved)));
             Ok(0)
         }
+        cli::Command::Export { path } => {
+            let config = Config::load()?;
+            match path.as_deref() {
+                Some("-") => println!("{}", backup::to_json(&config, config::now_unix_secs())?),
+                Some(path) => {
+                    let path = ssh::expand_tilde(path);
+                    backup::write(&config, &path)?;
+                    eprintln!(
+                        "Backed up {} server(s) to {}",
+                        config.servers.len(),
+                        path.display()
+                    );
+                }
+                None => {
+                    let path = backup::write_default(&config, "backup")?;
+                    eprintln!(
+                        "Backed up {} server(s) to {}",
+                        config.servers.len(),
+                        path.display()
+                    );
+                }
+            }
+            Ok(0)
+        }
+        cli::Command::Restore { path, replace } => {
+            let path = ssh::expand_tilde(&path);
+            let incoming = backup::load(&path)?;
+            restore_profile(incoming, replace)?;
+            Ok(0)
+        }
+        cli::Command::Terminfo { name, scope } => {
+            let config = Config::load()?;
+            let index = cli::find_server(&config, &name).map_err(anyhow::Error::msg)?;
+            let server = config.servers[index].clone();
+            install_terminfo(&config, &server, scope)
+        }
         cli::Command::Import { path } => {
             let path = match path {
                 Some(path) => ssh::expand_tilde(&path),
                 None => sshconfig::default_path().context("could not find a home directory")?,
             };
+            // `import` also takes a LazySSH backup and merges it.
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Some(incoming) = backup::parse(&text)? {
+                    restore_profile(incoming, false)?;
+                    return Ok(0);
+                }
+            }
             let mut config = Config::load()?;
             let found = sshconfig::load(&path)?;
             let total = found.len();
@@ -95,6 +139,57 @@ fn run(command: cli::Command) -> Result<u8> {
         }
         cli::Command::Tui => run_tui(),
     }
+}
+
+/// Applies a backup to the saved profile, first saving a safety backup of
+/// the current one so even `--replace` can be undone.
+fn restore_profile(incoming: Config, replace: bool) -> Result<()> {
+    let mut config = Config::load()?;
+    if !config.servers.is_empty() {
+        let safety = backup::write_default(&config, "before-restore")?;
+        eprintln!("Saved the current profile to {} first.", safety.display());
+    }
+    let report = backup::restore(&mut config, incoming, replace);
+    config.save()?;
+    if replace {
+        println!(
+            "Replaced the profile with {} server(s) from the backup.",
+            report.added
+        );
+    } else {
+        println!("Restored {} new server(s).", report.added);
+        if !report.skipped.is_empty() {
+            println!(
+                "Kept {} existing server(s) with the same name: {}",
+                report.skipped.len(),
+                report.skipped.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Installs the local terminal's terminfo on `server`, outside the TUI so
+/// `sudo` can prompt on the real terminal.
+fn install_terminfo(config: &Config, server: &Server, scope: ssh::TerminfoScope) -> Result<u8> {
+    let term = ssh::local_term()?;
+    let source = ssh::local_terminfo(&term)?;
+    let resolved = config.resolved(server)?;
+    println!(
+        "Installing `{term}` terminfo on {} ({}) ...",
+        server.name,
+        scope.label().to_lowercase()
+    );
+    if scope == ssh::TerminfoScope::System {
+        println!("(sudo on the server may ask for your password)");
+    }
+    let status = ssh::build_terminfo_command(&resolved, &term, &source, scope)
+        .status()
+        .context("failed to run ssh")?;
+    if !status.success() {
+        bail!("terminfo install on {} failed ({status})", server.name);
+    }
+    Ok(0)
 }
 
 /// Opens `config.servers[index]` in `mode`. With `replace`, the process is
@@ -172,6 +267,22 @@ fn run_tui() -> Result<u8> {
                 run_bootstrap(*server, &mut app.config);
                 return Ok(0);
             }
+            AppExit::Terminfo(scope) => {
+                let Some(server) = app.selected_server().cloned() else {
+                    continue;
+                };
+                // Outside the TUI so ssh and sudo prompts reach the terminal;
+                // the TUI comes back afterwards with the result.
+                let result = install_terminfo(&app.config, &server, scope);
+                match result {
+                    Ok(_) => app.set_status(
+                        app::StatusKind::Success,
+                        format!("Terminfo installed on {} ({})", server.name, scope.label()),
+                    ),
+                    Err(err) => app.set_status(app::StatusKind::Warn, format!("{err:#}")),
+                }
+                pause_for_enter();
+            }
         }
     }
 }
@@ -235,6 +346,13 @@ fn run_bootstrap(server: Server, config: &mut Config) {
     } else {
         println!("Not saved.");
     }
+}
+
+/// Leaves command output on screen until the user is ready to go back.
+fn pause_for_enter() {
+    print!("\nPress Enter to return to LazySSH ");
+    let _ = io::stdout().flush();
+    let _ = io::stdin().lock().read_line(&mut String::new());
 }
 
 /// Interprets the "Add this server?" answer; empty input means yes.

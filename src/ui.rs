@@ -10,11 +10,13 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, DraftServer, Field, FormPurpose, ImportCandidate, Mode, StatusKind};
+use crate::app::{
+    App, BackupEntry, DraftServer, Field, FormPurpose, ImportCandidate, Mode, StatusKind,
+};
 use crate::config::{Server, SshLauncher};
 use crate::forwards::ForwardKey;
 use crate::probe::Reach;
-use crate::ssh::LaunchMode;
+use crate::ssh::{LaunchMode, TerminfoScope};
 use crate::theme::{theme, Theme};
 
 /// Terminal width at which the dashboard switches from a compact single-line
@@ -110,6 +112,8 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("p", "Pin / unpin to the top"),
             ("i", "Import from ~/.ssh/config"),
             ("b", "Bootstrap: install your key"),
+            ("t", "Terminfo: fix clear/vim after sudo su"),
+            ("x", "Backups: create / restore"),
         ],
     ),
     (
@@ -134,6 +138,13 @@ const IMPORT_HELP_SHORT: &[(&str, &str)] = &[("Space", ""), ("A", ""), ("↵", "
 const FORWARDS_HELP: &[(&str, &str)] =
     &[("j/k", "Move"), ("Enter", "Start/Stop"), ("Esc", "Close")];
 const HELP_OVERLAY_HELP: &[(&str, &str)] = &[("Any key", "Close")];
+const BACKUPS_HELP: &[(&str, &str)] = &[
+    ("Enter", "Create/Merge"),
+    ("R", "Replace all"),
+    ("Esc", "Close"),
+];
+const BACKUPS_HELP_SHORT: &[(&str, &str)] = &[("↵", ""), ("R", ""), ("Esc", "")];
+const TERMINFO_HELP: &[(&str, &str)] = &[("j/k", "Move"), ("Enter", "Install"), ("Esc", "Cancel")];
 
 const SEARCH_HELP: &[(&str, &str)] = &[("Enter", "Apply"), ("Esc", "Clear"), ("Type", "Filter")];
 
@@ -187,6 +198,12 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::Launch { mode } => render_launch_popup(frame, app, *mode, t),
         Mode::Import { candidates, cursor } => render_import_popup(frame, candidates, *cursor, t),
         Mode::Forwards { cursor } => render_forwards_popup(frame, app, *cursor, t),
+        Mode::Backups {
+            dir,
+            entries,
+            cursor,
+        } => render_backups_popup(frame, dir, entries, *cursor, t),
+        Mode::Terminfo { scope } => render_terminfo_popup(frame, app, *scope, t),
         Mode::Normal | Mode::Search => {}
     }
 }
@@ -1275,6 +1292,128 @@ fn render_forwards_popup(frame: &mut Frame, app: &App, cursor: usize, t: &Theme)
     render_rows(frame, inner, hint_line(FORWARDS_HELP, t), rows, cursor);
 }
 
+/// Display name of a backup file: the label and a readable UTC time.
+fn backup_label(file_name: &str) -> String {
+    let stem = file_name
+        .strip_prefix("lazyssh-")
+        .and_then(|s| s.strip_suffix(".json"))
+        .unwrap_or(file_name);
+    // `<label>-YYYYMMDD-HHMMSS`
+    let Some((label, stamp)) = stem.len().checked_sub(16).map(|i| stem.split_at(i)) else {
+        return stem.to_string();
+    };
+    let s = &stamp[1..];
+    if s.len() != 15 || !s.is_char_boundary(8) {
+        return stem.to_string();
+    }
+    format!(
+        "{}-{}-{} {}:{}  {label}",
+        &s[0..4],
+        &s[4..6],
+        &s[6..8],
+        &s[9..11],
+        &s[11..13]
+    )
+}
+
+fn render_backups_popup(
+    frame: &mut Frame,
+    dir: &std::path::Path,
+    entries: &[BackupEntry],
+    cursor: usize,
+    t: &Theme,
+) {
+    let rows_wanted = entries.len().min(12) + 4;
+    let inner = modal(frame, " ⛁ ", "BACKUPS ", 76, rows_wanted + 2, t);
+    let width = inner.width as usize;
+    let mut rows = vec![choice_row(
+        cursor == 0,
+        "+ New backup".to_string(),
+        "save every server and setting now".to_string(),
+        34,
+        width,
+        t,
+    )];
+    if entries.is_empty() {
+        rows.push(Line::styled(
+            "    no backups yet",
+            Style::default().fg(t.muted).add_modifier(Modifier::ITALIC),
+        ));
+    }
+    for (i, entry) in entries.iter().enumerate() {
+        let detail = match entry.servers {
+            Some(1) => "1 server".to_string(),
+            Some(n) => format!("{n} servers"),
+            None => "unreadable".to_string(),
+        };
+        rows.push(choice_row(
+            cursor == i + 1,
+            backup_label(&entry.file_name),
+            detail,
+            34,
+            width,
+            t,
+        ));
+    }
+    rows.push(Line::raw(""));
+    rows.push(Line::styled(
+        truncate_label(
+            "Enter merges new servers, R replaces all; current profile is saved first.",
+            width,
+        ),
+        Style::default().fg(t.muted).add_modifier(Modifier::ITALIC),
+    ));
+    rows.push(Line::styled(
+        truncate_label(&format!("in {}", dir.display()), width),
+        Style::default().fg(t.muted),
+    ));
+    let full = hint_line(BACKUPS_HELP, t);
+    let hint = if full.width() > width {
+        hint_line(BACKUPS_HELP_SHORT, t)
+    } else {
+        full
+    };
+    render_rows(frame, inner, hint, rows, cursor);
+}
+
+fn render_terminfo_popup(frame: &mut Frame, app: &App, active: TerminfoScope, t: &Theme) {
+    let name = app
+        .selected_server()
+        .map(|s| s.name.clone())
+        .unwrap_or_default();
+    let term = std::env::var("TERM").unwrap_or_default();
+    let inner = modal(frame, " ⚙ ", "INSTALL TERMINFO ", 70, 7, t);
+    let width = inner.width as usize;
+    let mut rows: Vec<Line<'static>> = TerminfoScope::ALL
+        .iter()
+        .map(|&scope| {
+            choice_row(
+                scope == active,
+                scope.label().to_string(),
+                scope.description().to_string(),
+                10,
+                width,
+                t,
+            )
+        })
+        .collect();
+    rows.push(Line::raw(""));
+    for text in [
+        format!("Teaches {name} what `{term}` is, so clear, vim, less and"),
+        "tmux work for every account, without changing TERM.".to_string(),
+    ] {
+        rows.push(Line::styled(
+            truncate_label(&text, width),
+            Style::default().fg(t.muted),
+        ));
+    }
+    let active_row = TerminfoScope::ALL
+        .iter()
+        .position(|s| *s == active)
+        .unwrap_or(0);
+    render_rows(frame, inner, hint_line(TERMINFO_HELP, t), rows, active_row);
+}
+
 fn help_for(mode: &Mode) -> &'static [(&'static str, &'static str)] {
     match mode {
         Mode::Normal => NORMAL_HELP,
@@ -1286,6 +1425,8 @@ fn help_for(mode: &Mode) -> &'static [(&'static str, &'static str)] {
         Mode::Launch { .. } => LIST_DIALOG_HELP,
         Mode::Import { .. } => IMPORT_HELP,
         Mode::Forwards { .. } => FORWARDS_HELP,
+        Mode::Backups { .. } => BACKUPS_HELP,
+        Mode::Terminfo { .. } => TERMINFO_HELP,
     }
 }
 
@@ -1300,6 +1441,8 @@ fn short_help_for(mode: &Mode) -> &'static [(&'static str, &'static str)] {
         Mode::Launch { .. } => SETTINGS_HELP_SHORT,
         Mode::Import { .. } => IMPORT_HELP_SHORT,
         Mode::Forwards { .. } => SETTINGS_HELP_SHORT,
+        Mode::Backups { .. } => BACKUPS_HELP_SHORT,
+        Mode::Terminfo { .. } => SETTINGS_HELP_SHORT,
     }
 }
 
@@ -2334,6 +2477,63 @@ mod tests {
     }
 
     #[test]
+    fn backup_labels_are_readable() {
+        assert_eq!(
+            backup_label("lazyssh-backup-20261002-130500.json"),
+            "2026-10-02 13:05  backup"
+        );
+        assert_eq!(
+            backup_label("lazyssh-before-restore-20261002-130500.json"),
+            "2026-10-02 13:05  before-restore"
+        );
+        assert_eq!(backup_label("lazyssh-x.json"), "x");
+    }
+
+    #[test]
+    fn backup_and_terminfo_dialogs_render_at_every_size() {
+        let mut app = sample_app(2);
+        let entries: Vec<BackupEntry> = (0..20)
+            .map(|i| BackupEntry {
+                path: format!("/b/{i}").into(),
+                file_name: format!("lazyssh-backup-202610{:02}-120000.json", i + 1),
+                servers: if i == 3 { None } else { Some(i) },
+            })
+            .collect();
+        let modes = [
+            Mode::Backups {
+                dir: "/home/u/.config/lazyssh/backups".into(),
+                entries: entries.clone(),
+                cursor: 20,
+            },
+            Mode::Backups {
+                dir: "/x".into(),
+                entries: Vec::new(),
+                cursor: 0,
+            },
+            Mode::Terminfo {
+                scope: TerminfoScope::User,
+            },
+        ];
+        for mode in modes {
+            app.mode = mode;
+            for (w, h) in [(120, 40), (84, 24), (60, 18), (40, 12), (20, 8), (5, 3)] {
+                let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+                terminal.draw(|f| render(f, &app)).unwrap();
+            }
+        }
+        app.mode = Mode::Backups {
+            dir: "/x".into(),
+            entries,
+            cursor: 20,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 34)).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("2026-10-20 12:00  backup"), "{text}");
+        assert!(text.contains("19 servers"), "{text}");
+    }
+
+    #[test]
     fn help_overlay_lists_every_action_key() {
         let mut app = sample_app(1);
         app.open_help();
@@ -2352,6 +2552,8 @@ mod tests {
             "port forwards",
             "Re-check reachability",
             "#tag",
+            "Terminfo: fix clear/vim after sudo su",
+            "Backups: create / restore",
         ] {
             assert!(text.contains(what), "{what} missing:\n{text}");
         }

@@ -481,6 +481,147 @@ pub fn build_bootstrap_command(server: &Server) -> Command {
     cmd
 }
 
+/// Where to install the local terminal's terminfo entry on a server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminfoScope {
+    /// The system database via `sudo tic`: every account on the host —
+    /// including ones reached with `sudo su - other`, root, and tmux —
+    /// can resolve the terminal.
+    System,
+    /// `~/.terminfo` of the login user only; no sudo needed.
+    User,
+}
+
+impl TerminfoScope {
+    pub const ALL: [TerminfoScope; 2] = [TerminfoScope::System, TerminfoScope::User];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TerminfoScope::System => "All users",
+            TerminfoScope::User => "Just me",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            TerminfoScope::System => "sudo tic: fixes `sudo su - user`, root, tmux",
+            TerminfoScope::User => "~/.terminfo of the login user, no sudo",
+        }
+    }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            TerminfoScope::System => TerminfoScope::User,
+            TerminfoScope::User => TerminfoScope::System,
+        }
+    }
+}
+
+/// Whether `term` is a plausible terminfo name. It is interpolated into the
+/// remote script, so anything outside this charset is refused.
+pub fn valid_term_name(term: &str) -> bool {
+    !term.is_empty()
+        && term.len() <= 64
+        && !term.starts_with('-')
+        && term
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._+-".contains(c))
+}
+
+/// The local terminal type to ship: `$TERM`, refusing `dumb` and empty.
+pub fn local_term() -> Result<String> {
+    let term = std::env::var("TERM").unwrap_or_default();
+    if term.is_empty() || term == "dumb" {
+        bail!("TERM is not set to a real terminal here, so there is no terminfo to send");
+    }
+    if !valid_term_name(&term) {
+        bail!("TERM `{term}` is not a valid terminfo name");
+    }
+    Ok(term)
+}
+
+/// The terminfo source for `term` from the local database, via `infocmp`.
+pub fn local_terminfo(term: &str) -> Result<String> {
+    if !valid_term_name(term) {
+        bail!("`{term}` is not a valid terminfo name");
+    }
+    let output = Command::new("infocmp")
+        .args(["-a", "-x", term])
+        .output()
+        .context("failed to run `infocmp` locally (install ncurses)")?;
+    if !output.status.success() {
+        bail!(
+            "infocmp has no entry for `{term}`: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let source = String::from_utf8(output.stdout).context("infocmp printed non-UTF-8 output")?;
+    if source.trim().is_empty() {
+        bail!("infocmp printed an empty entry for `{term}`");
+    }
+    Ok(source)
+}
+
+/// The fixed remote script that compiles a terminfo entry. tic's stderr
+/// is only shown on failure: it warns about harmless portability details
+/// (e.g. Kitty's description field) on every successful run.
+///
+/// Only the term name (validated charset) and base64 text
+/// (`[A-Za-z0-9+/=]`) are interpolated, and the script contains no single
+/// quotes, so wrapping it in `sh -c '…'` is safe whatever the remote login
+/// shell is.
+fn terminfo_remote_script(term: &str, source_b64: &str, scope: TerminfoScope) -> String {
+    let install = match scope {
+        TerminfoScope::System => {
+            "if [ \"$(id -u)\" = 0 ]; then tic -x \"$src\" 2>\"$err\" || fail; \
+             else command -v sudo >/dev/null 2>&1 \
+               || { echo \"lazyssh: sudo not found; use the per-user install instead\" >&2; exit 1; }; \
+             sudo env -u TERMINFO -u TERMINFO_DIRS tic -x \"$src\" 2>\"$err\" || fail; fi; \
+             HOME=/nonexistent env -u TERMINFO -u TERMINFO_DIRS infocmp \"$term\" >/dev/null; \
+             echo \"lazyssh: $term installed system-wide on $(hostname): every user can use it now\""
+        }
+        TerminfoScope::User => {
+            "tic -x -o \"$HOME/.terminfo\" \"$src\" 2>\"$err\" || fail; \
+             env -u TERMINFO -u TERMINFO_DIRS infocmp \"$term\" >/dev/null; \
+             echo \"lazyssh: $term installed for $(id -un) on $(hostname)\""
+        }
+    };
+    let script = format!(
+        "set -e; term={term}; blob={source_b64}; \
+         src=$(mktemp \"${{TMPDIR:-/tmp}}/lazyssh-terminfo.XXXXXX\"); err=$src.err; \
+         trap \"rm -f $src $err\" EXIT; \
+         fail() {{ cat \"$err\" >&2; echo \"lazyssh: tic could not compile the entry\" >&2; exit 1; }}; \
+         if ! printf %s \"$blob\" | base64 -d >\"$src\" 2>/dev/null; then \
+           printf %s \"$blob\" | base64 -D >\"$src\" 2>/dev/null \
+           || {{ echo \"lazyssh: base64 is not available on this host\" >&2; exit 1; }}; fi; \
+         command -v tic >/dev/null 2>&1 \
+           || {{ echo \"lazyssh: tic not found; install ncurses (ncurses-bin on Debian/Ubuntu)\" >&2; exit 1; }}; \
+         {install}"
+    );
+    format!("exec sh -c '{script}'")
+}
+
+/// `ssh [-t] <options> <target> <script>` installing `source` (the output
+/// of `infocmp -a -x term`) on `server`. The system scope allocates a tty so
+/// `sudo` can ask for a password on the terminal itself; LazySSH never
+/// sees it. The terminal's own `TERM` is never changed.
+pub fn build_terminfo_command(
+    server: &Server,
+    term: &str,
+    source: &str,
+    scope: TerminfoScope,
+) -> Command {
+    let mut cmd = Command::new("ssh");
+    if scope == TerminfoScope::System {
+        cmd.arg("-t");
+    }
+    push_ssh_options(&mut cmd, server);
+    cmd.arg(target(server));
+    let encoded = crate::clipboard::base64(source.as_bytes());
+    cmd.arg(terminfo_remote_script(term, &encoded, scope));
+    cmd
+}
+
 /// Expands a leading `~`/`~/` in `path` to the home directory.
 pub fn expand_tilde(path: &str) -> PathBuf {
     if path == "~" {
@@ -1055,6 +1196,76 @@ mod tests {
             got[got.len() - 3..],
             ["-L", "8080:localhost:80", "deploy@example.com"]
         );
+    }
+
+    #[test]
+    fn term_names_are_validated() {
+        for ok in [
+            "xterm-kitty",
+            "xterm-256color",
+            "tmux-256color",
+            "wezterm",
+            "foot+base",
+            "st.x",
+        ] {
+            assert!(valid_term_name(ok), "{ok}");
+        }
+        for bad in ["", "-x", "a b", "x;rm", "a'b", "a$b", &"x".repeat(65)] {
+            assert!(!valid_term_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn terminfo_command_ships_source_inertly() {
+        let mut server = full_server();
+        server.jump_host = Some("bastion".into());
+        let source = "xterm-kitty|KovIdTTY,\n\tam, clear=\\E[H\\E[2J,\n";
+        let system = build_terminfo_command(&server, "xterm-kitty", source, TerminfoScope::System);
+        let sys_args = args(&system);
+        assert_eq!(system.get_program(), "ssh");
+        assert_eq!(
+            sys_args[0], "-t",
+            "sudo needs a tty for its password prompt"
+        );
+        assert!(sys_args.windows(2).any(|w| w == ["-J", "bastion"]));
+        let script = sys_args.last().unwrap();
+        assert!(script.starts_with("exec sh -c '") && script.ends_with('\''));
+        // Exactly the two wrapping quotes: nothing can break out of sh -c.
+        assert_eq!(script.matches('\'').count(), 2);
+        assert!(script.contains(&crate::clipboard::base64(source.as_bytes())));
+        assert!(
+            !script.contains("KovIdTTY"),
+            "source travels base64-encoded"
+        );
+        assert!(script.contains("sudo env -u TERMINFO -u TERMINFO_DIRS tic -x"));
+
+        let user = build_terminfo_command(&server, "xterm-kitty", source, TerminfoScope::User);
+        let user_args = args(&user);
+        assert_ne!(user_args[0], "-t");
+        assert!(user_args
+            .last()
+            .unwrap()
+            .contains("tic -x -o \"$HOME/.terminfo\""));
+        assert!(!user_args.last().unwrap().contains("sudo"));
+        assert_eq!(TerminfoScope::User.toggle(), TerminfoScope::System);
+    }
+
+    #[test]
+    fn terminfo_scripts_contain_no_unrendered_format_braces() {
+        // The scope snippet is a format *argument*, so `{{` in it would reach
+        // the remote shell verbatim and break the script.
+        for scope in TerminfoScope::ALL {
+            let script = terminfo_remote_script("xterm-kitty", "QUJD", scope);
+            assert!(
+                !script.contains("{{") && !script.contains("}}"),
+                "{scope:?}: {script}"
+            );
+            assert_eq!(
+                script.matches('{').count(),
+                script.matches('}').count(),
+                "{scope:?}: unbalanced braces"
+            );
+        }
     }
 
     fn full_server() -> Server {

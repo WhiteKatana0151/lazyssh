@@ -2,7 +2,7 @@
 //! `cmd`, and `import`. Parsing is pure so it can be tested directly.
 
 use crate::config::{Config, Server};
-use crate::ssh::LaunchMode;
+use crate::ssh::{LaunchMode, TerminfoScope};
 
 pub const USAGE: &str = "\
 lazyssh — a tiny TUI for your SSH servers
@@ -13,7 +13,15 @@ USAGE:
     lazyssh connect <name> [...]   same, for servers named like a subcommand
     lazyssh ls [--tag <tag>]       list servers: name, target, tags
     lazyssh cmd <name>             print the ssh command line for a server
-    lazyssh import [PATH]          import new hosts from ~/.ssh/config (or PATH)
+    lazyssh import [PATH]          import from ~/.ssh/config, or a LazySSH backup
+    lazyssh export [PATH|-]        back up every server and setting
+                                   (default: ~/.config/lazyssh/backups/)
+    lazyssh restore PATH [--replace]
+                                   merge a backup (new names only), or replace
+                                   the whole profile; a safety backup is taken first
+    lazyssh terminfo <name> [--user]
+                                   install this terminal's terminfo on a server,
+                                   system-wide via sudo (default) or just for you
     lazyssh --help | --version
 ";
 
@@ -26,6 +34,9 @@ pub enum Command {
     List { tag: Option<String> },
     Print { name: String },
     Import { path: Option<String> },
+    Export { path: Option<String> },
+    Restore { path: String, replace: bool },
+    Terminfo { name: String, scope: TerminfoScope },
 }
 
 /// Parses `args` (without the program name).
@@ -61,6 +72,39 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 path: Some(path.to_string()),
             }),
             _ => Err("usage: lazyssh import [PATH]".into()),
+        },
+        "export" | "backup" => match rest.as_slice() {
+            [] => Ok(Command::Export { path: None }),
+            [path] => Ok(Command::Export {
+                path: Some(path.to_string()),
+            }),
+            _ => Err("usage: lazyssh export [PATH|-]".into()),
+        },
+        "restore" => match rest.as_slice() {
+            [path] | [path, "--merge"] => Ok(Command::Restore {
+                path: path.to_string(),
+                replace: false,
+            }),
+            [path, "--replace"] | ["--replace", path] => Ok(Command::Restore {
+                path: path.to_string(),
+                replace: true,
+            }),
+            _ => Err("usage: lazyssh restore PATH [--replace]".into()),
+        },
+        "terminfo" => match rest.as_slice() {
+            [name] => Ok(Command::Terminfo {
+                name: name.to_string(),
+                scope: TerminfoScope::System,
+            }),
+            [name, "--user"] => Ok(Command::Terminfo {
+                name: name.to_string(),
+                scope: TerminfoScope::User,
+            }),
+            [name, "--system"] => Ok(Command::Terminfo {
+                name: name.to_string(),
+                scope: TerminfoScope::System,
+            }),
+            _ => Err("usage: lazyssh terminfo <name> [--user]".into()),
         },
         "connect" => match rest.split_first() {
             Some((name, flags)) => connect(name, flags),
@@ -191,6 +235,62 @@ mod tests {
                 path: Some("/tmp/cfg".into())
             })
         );
+    }
+
+    #[test]
+    fn parses_backup_and_terminfo_commands() {
+        assert_eq!(
+            parse(&args(&["export"])),
+            Ok(Command::Export { path: None })
+        );
+        assert_eq!(
+            parse(&args(&["backup", "-"])),
+            Ok(Command::Export {
+                path: Some("-".into())
+            })
+        );
+        assert_eq!(
+            parse(&args(&["restore", "b.json"])),
+            Ok(Command::Restore {
+                path: "b.json".into(),
+                replace: false
+            })
+        );
+        for form in [
+            &["restore", "b.json", "--replace"][..],
+            &["restore", "--replace", "b.json"],
+        ] {
+            assert_eq!(
+                parse(&args(form)),
+                Ok(Command::Restore {
+                    path: "b.json".into(),
+                    replace: true
+                })
+            );
+        }
+        assert_eq!(
+            parse(&args(&["terminfo", "prod"])),
+            Ok(Command::Terminfo {
+                name: "prod".into(),
+                scope: TerminfoScope::System
+            })
+        );
+        assert_eq!(
+            parse(&args(&["terminfo", "prod", "--user"])),
+            Ok(Command::Terminfo {
+                name: "prod".into(),
+                scope: TerminfoScope::User
+            })
+        );
+        for bad in [
+            &["restore"][..],
+            &["restore", "a", "--nuke"],
+            &["export", "a", "b"],
+            &["terminfo"],
+            &["terminfo", "a", "--root"],
+        ] {
+            assert!(parse(&args(bad)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

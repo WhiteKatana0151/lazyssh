@@ -2,6 +2,7 @@
 //! persistence in [`crate::config`]; the ssh handoff in [`crate::ssh`].
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -9,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::config::{Config, Server, SshLauncher};
 use crate::forwards::{ForwardKey, Forwards};
 use crate::probe::{probe_key, Prober, Reach};
-use crate::ssh::{ForwardSpec, LaunchMode};
+use crate::ssh::{ForwardSpec, LaunchMode, TerminfoScope};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -301,6 +302,58 @@ pub enum Mode {
     Forwards {
         cursor: usize,
     },
+    /// Creating backups and restoring them. Row 0 is "new backup"; row
+    /// `n` is `entries[n - 1]`.
+    Backups {
+        dir: PathBuf,
+        entries: Vec<BackupEntry>,
+        cursor: usize,
+    },
+    /// Choosing where to install the local terminfo on the selected server.
+    Terminfo {
+        scope: TerminfoScope,
+    },
+}
+
+/// One backup file in the backups dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupEntry {
+    pub path: PathBuf,
+    pub file_name: String,
+    /// Server count, or `None` when the file could not be read as a backup.
+    pub servers: Option<usize>,
+}
+
+/// The `YYYYMMDD-HHMMSS` suffix of a backup file name.
+fn backup_stamp(name: &str) -> &str {
+    let stem = name.strip_suffix(".json").unwrap_or(name);
+    stem.get(stem.len().saturating_sub(15)..).unwrap_or(stem)
+}
+
+/// LazySSH backups in `dir`, newest first (names embed a sortable UTC
+/// timestamp). A missing directory simply has no backups.
+pub fn list_backups(dir: &Path) -> Vec<BackupEntry> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<BackupEntry> = read
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("lazyssh-") && n.ends_with(".json"))
+        })
+        .map(|path| BackupEntry {
+            file_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+            servers: crate::backup::load(&path).ok().map(|c| c.servers.len()),
+            path,
+        })
+        .collect();
+    // Sort by the trailing `YYYYMMDD-HHMMSS`, so `before-restore` and
+    // `backup` files interleave chronologically rather than by label.
+    entries.sort_by(|a, b| backup_stamp(&b.file_name).cmp(backup_stamp(&a.file_name)));
+    entries
 }
 
 /// One importable host in the import dialog.
@@ -330,6 +383,8 @@ pub enum AppExit {
     /// Leave the TUI and install this (not yet saved) server's public key on
     /// the remote host; the user is asked afterwards whether to save it.
     Bootstrap(Box<Server>),
+    /// Leave the TUI and install the local terminfo on the selected server.
+    Terminfo(TerminfoScope),
 }
 
 #[derive(Debug)]
@@ -587,6 +642,118 @@ impl App {
                 Err(err) => self.set_status(StatusKind::Warn, format!("Copy failed: {err}")),
             },
         }
+    }
+
+    pub fn open_terminfo(&mut self) {
+        if self.selected_server().is_none() {
+            self.set_status(StatusKind::Warn, "No server selected");
+            return;
+        }
+        self.mode = Mode::Terminfo {
+            scope: TerminfoScope::System,
+        };
+        self.status_kind = StatusKind::Hint;
+    }
+
+    /// Opens the backups dialog on the default backups directory.
+    pub fn open_backups(&mut self) {
+        match crate::backup::default_dir() {
+            Ok(dir) => self.open_backups_in(dir),
+            Err(err) => self.set_status(StatusKind::Warn, err.to_string()),
+        }
+    }
+
+    pub fn open_backups_in(&mut self, dir: PathBuf) {
+        let entries = list_backups(&dir);
+        self.mode = Mode::Backups {
+            dir,
+            entries,
+            cursor: 0,
+        };
+        self.status_kind = StatusKind::Hint;
+    }
+
+    /// Writes a new backup into the dialog's directory and refreshes it.
+    fn create_backup(&mut self) {
+        let Mode::Backups { dir, .. } = &self.mode else {
+            return;
+        };
+        let dir = dir.clone();
+        let path = dir.join(crate::backup::file_name(
+            "backup",
+            crate::config::now_unix_secs(),
+        ));
+        match crate::backup::write(&self.config, &path) {
+            Ok(()) => {
+                self.open_backups_in(dir);
+                self.set_status(
+                    StatusKind::Success,
+                    format!("Backed up to {}", path.display()),
+                );
+            }
+            Err(err) => self.set_status(StatusKind::Warn, format!("Backup failed: {err:#}")),
+        }
+    }
+
+    /// Restores the highlighted backup — merging new names, or replacing
+    /// the profile — after writing a safety backup of the current one.
+    fn restore_backup_with(
+        &mut self,
+        replace: bool,
+        save: impl FnOnce(&Config) -> Result<()>,
+    ) -> Result<()> {
+        let Mode::Backups {
+            dir,
+            entries,
+            cursor,
+        } = &self.mode
+        else {
+            return Ok(());
+        };
+        let Some(entry) = cursor.checked_sub(1).and_then(|i| entries.get(i)).cloned() else {
+            return Ok(());
+        };
+        let dir = dir.clone();
+        let incoming = crate::backup::load(&entry.path)?;
+        if !self.config.servers.is_empty() {
+            let safety = dir.join(crate::backup::file_name(
+                "before-restore",
+                crate::config::now_unix_secs(),
+            ));
+            crate::backup::write(&self.config, &safety)?;
+        }
+        // Forwards belong to servers that may vanish in a replace.
+        if replace {
+            self.forwards.stop_all();
+        }
+        let mut next = self.config.clone();
+        let report = crate::backup::restore(&mut next, incoming, replace);
+        save(&next)?;
+        self.config = next;
+        self.config.sort_by_recency();
+        self.selected = 0;
+        self.ensure_selection_visible();
+        self.mode = Mode::Normal;
+        self.refresh_reachability();
+        let message = if replace {
+            format!(
+                "Replaced profile with {} server(s) from {}",
+                report.added, entry.file_name
+            )
+        } else if report.skipped.is_empty() {
+            format!(
+                "Restored {} server(s) from {}",
+                report.added, entry.file_name
+            )
+        } else {
+            format!(
+                "Restored {} server(s); kept {} existing with the same name",
+                report.added,
+                report.skipped.len()
+            )
+        };
+        self.set_status(StatusKind::Success, message);
+        Ok(())
     }
 
     /// Opens the import dialog from `~/.ssh/config`.
@@ -909,6 +1076,14 @@ fn handle_key_with_settings_commit(
                 app.open_forwards();
                 Ok(None)
             }
+            KeyCode::Char('x' | 'X') => {
+                app.open_backups();
+                Ok(None)
+            }
+            KeyCode::Char('t' | 'T') => {
+                app.open_terminfo();
+                Ok(None)
+            }
             KeyCode::Char('r' | 'R') => {
                 app.reach.clear();
                 app.refresh_reachability();
@@ -1026,6 +1201,49 @@ fn handle_key_with_settings_commit(
         },
         Mode::Help => {
             app.mode = Mode::Normal;
+            Ok(None)
+        }
+        Mode::Terminfo { scope } => match key.code {
+            KeyCode::Char('j' | 'J' | 'k' | 'K') | KeyCode::Down | KeyCode::Up | KeyCode::Tab => {
+                *scope = scope.toggle();
+                Ok(None)
+            }
+            KeyCode::Enter => {
+                let chosen = *scope;
+                app.mode = Mode::Normal;
+                Ok(Some(AppExit::Terminfo(chosen)))
+            }
+            KeyCode::Esc | KeyCode::Char('q' | 'Q') => {
+                app.mode = Mode::Normal;
+                Ok(None)
+            }
+            _ => Ok(None),
+        },
+        Mode::Backups {
+            entries, cursor, ..
+        } => {
+            match key.code {
+                KeyCode::Char('j' | 'J') | KeyCode::Down => {
+                    *cursor = (*cursor + 1).min(entries.len());
+                }
+                KeyCode::Char('k' | 'K') | KeyCode::Up => {
+                    *cursor = cursor.saturating_sub(1);
+                }
+                KeyCode::Enter if *cursor == 0 => app.create_backup(),
+                KeyCode::Char('n' | 'N') => app.create_backup(),
+                KeyCode::Enter | KeyCode::Char('m' | 'M') => {
+                    if let Err(err) = app.restore_backup_with(false, Config::save) {
+                        app.set_status(StatusKind::Warn, format!("Restore failed: {err:#}"));
+                    }
+                }
+                KeyCode::Char('R') => {
+                    if let Err(err) = app.restore_backup_with(true, Config::save) {
+                        app.set_status(StatusKind::Warn, format!("Restore failed: {err:#}"));
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('q' | 'Q') => app.mode = Mode::Normal,
+                _ => {}
+            }
             Ok(None)
         }
         Mode::Launch { mode } => match key.code {
@@ -1509,6 +1727,149 @@ mod tests {
         assert!(matches!(app.mode, Mode::Forwards { cursor: 1 }));
         key(&mut app, KeyCode::Esc);
         assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn backups_dialog_creates_lists_and_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(Config::default());
+        let mut a = sample_server("a");
+        a.tags = vec!["lab".into()];
+        app.config.add(a);
+        app.open_backups_in(dir.path().to_path_buf());
+        // Enter on row 0 creates a backup.
+        key(&mut app, KeyCode::Enter);
+        let Mode::Backups { entries, .. } = &app.mode else {
+            panic!("{:?}", app.mode);
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].servers, Some(1));
+        assert_eq!(app.status_kind, StatusKind::Success);
+
+        // Change the live profile, then merge the backup back in.
+        app.config.servers[0].name = "renamed".into();
+        app.config.add(sample_server("b"));
+        if let Mode::Backups { cursor, .. } = &mut app.mode {
+            *cursor = 1;
+        }
+        let mut saved = None;
+        app.restore_backup_with(false, |c| {
+            saved = Some(c.clone());
+            Ok(())
+        })
+        .unwrap();
+        let mut names: Vec<_> = app.config.servers.iter().map(|s| s.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, ["a", "b", "renamed"]);
+        assert_eq!(saved.unwrap().servers.len(), 3);
+        assert!(matches!(app.mode, Mode::Normal));
+        // The safety backup of the pre-restore profile was written.
+        let listed = list_backups(dir.path());
+        assert_eq!(listed.len(), 2);
+        assert!(listed
+            .iter()
+            .any(|e| e.file_name.contains("before-restore")));
+    }
+
+    #[test]
+    fn backups_replace_swaps_the_whole_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backed_up = Config::default();
+        backed_up.add(sample_server("from-backup"));
+        backed_up.launcher = SshLauncher::Kitty;
+        crate::backup::write(
+            &backed_up,
+            &dir.path().join(crate::backup::file_name("backup", 1_000)),
+        )
+        .unwrap();
+
+        let mut app = App::new(Config::default());
+        app.config.add(sample_server("current"));
+        app.open_backups_in(dir.path().to_path_buf());
+        key(&mut app, KeyCode::Down);
+        app.restore_backup_with(true, |_| Ok(())).unwrap();
+        let names: Vec<_> = app.config.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["from-backup"]);
+        assert_eq!(app.config.launcher, SshLauncher::Kitty);
+        assert!(app.status.starts_with("Replaced profile"));
+    }
+
+    #[test]
+    fn failed_restore_save_leaves_the_profile_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backed_up = Config::default();
+        backed_up.add(sample_server("x"));
+        crate::backup::write(
+            &backed_up,
+            &dir.path().join("lazyssh-backup-20260101-000000.json"),
+        )
+        .unwrap();
+        let mut app = App::new(Config::default());
+        app.config.add(sample_server("keep"));
+        app.open_backups_in(dir.path().to_path_buf());
+        key(&mut app, KeyCode::Down);
+        assert!(app
+            .restore_backup_with(true, |_| anyhow::bail!("disk full"))
+            .is_err());
+        assert_eq!(app.config.servers[0].name, "keep");
+        assert!(matches!(app.mode, Mode::Backups { .. }));
+    }
+
+    #[test]
+    fn backup_list_sorts_by_time_not_label() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "lazyssh-backup-20260101-000000.json",
+            "lazyssh-before-restore-20260301-000000.json",
+            "lazyssh-backup-20260201-000000.json",
+            "unrelated.json",
+            "lazyssh-broken-20260401-000000.json",
+        ] {
+            let body = if name.contains("broken") || name == "unrelated.json" {
+                "nope".to_string()
+            } else {
+                crate::backup::to_json(&Config::default(), 0).unwrap()
+            };
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        let listed = list_backups(dir.path());
+        let names: Vec<_> = listed.iter().map(|e| e.file_name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "lazyssh-broken-20260401-000000.json",
+                "lazyssh-before-restore-20260301-000000.json",
+                "lazyssh-backup-20260201-000000.json",
+                "lazyssh-backup-20260101-000000.json",
+            ]
+        );
+        assert_eq!(listed[0].servers, None);
+        assert!(list_backups(&dir.path().join("missing")).is_empty());
+    }
+
+    #[test]
+    fn terminfo_dialog_defaults_to_system_and_exits_with_the_choice() {
+        let mut app = App::new(Config::default());
+        key(&mut app, KeyCode::Char('t'));
+        assert!(matches!(app.mode, Mode::Normal), "needs a server");
+        app.config.add(sample_server("prod"));
+        key(&mut app, KeyCode::Char('t'));
+        assert!(matches!(
+            app.mode,
+            Mode::Terminfo {
+                scope: TerminfoScope::System
+            }
+        ));
+        assert_eq!(
+            key(&mut app, KeyCode::Enter),
+            Some(AppExit::Terminfo(TerminfoScope::System))
+        );
+        key(&mut app, KeyCode::Char('t'));
+        key(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            key(&mut app, KeyCode::Enter),
+            Some(AppExit::Terminfo(TerminfoScope::User))
+        );
     }
 
     #[test]
