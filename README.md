@@ -17,6 +17,8 @@ It stores only connection metadata and SSH key paths. It does not store password
 - **Duplicate** (`D`) a server into a prefilled add form; **copy** (`y`) its exact ssh command line to the clipboard (`wl-copy`, `xclip`/`xsel`, `clip.exe`, else OSC 52 through the terminal).
 - **Open as SSH, SFTP, or Mosh** (`o`). Mosh tunnels its bootstrap through ssh with the same key, port, jump host, and options.
 - **Saved port forwards** (`f`): store `L8080:localhost:80`, `R9000:localhost:9000`, or `D1080` per server and start/stop them from the TUI. They run as background `ssh -N` processes, are shown as `⇄n` on the row, and are all stopped when LazySSH exits. While forwards are running, connecting to a server returns you to LazySSH afterwards instead of replacing it.
+- **Backups** (`x`, or `lazyssh export` / `restore`): snapshot every server, tag, pin, forward, and the launcher setting to a JSON file, and restore it on this or another machine. Restores merge new servers by default or replace the whole profile, and always save the current profile first so they can be undone. See [Backups](#backups).
+- **Terminfo install** (`t`, or `lazyssh terminfo <name>`): fixes `clear`, `vim`, `less`, `tmux` breaking after `sudo su - other-user` on a server when using Kitty (or any terminal with its own `TERM`). See [Terminal type on servers](#terminal-type-on-servers-sudo-su---and-kitty).
 - **Command-line mode** for scripts and muscle memory (see below).
 - `?` opens a full key reference.
 - Connect through native OpenSSH or Kitty's SSH kitten, selected safely and configured from the TUI.
@@ -63,7 +65,12 @@ lazyssh <name> [--sftp|--mosh] connect by name (exact, else unique prefix)
 lazyssh connect <name> [...]   same, for servers named like a subcommand
 lazyssh ls [--tag <tag>]       tab-separated: name, user@host:port, tags
 lazyssh cmd <name>             print the ssh command line for a server
-lazyssh import [PATH]          import new hosts from ~/.ssh/config (or PATH)
+lazyssh import [PATH]          import from ~/.ssh/config, or a LazySSH backup
+lazyssh export [PATH|-]        back up everything (default: ~/.config/lazyssh/backups/)
+lazyssh restore PATH [--replace]
+                               merge a backup, or replace the whole profile
+lazyssh terminfo <name> [--user]
+                               install this terminal's terminfo on a server
 lazyssh --help | --version
 ```
 
@@ -92,6 +99,8 @@ d            delete selected server
 p            pin / unpin
 i            import from ~/.ssh/config
 b            bootstrap a new server (install your public key)
+t            install this terminal's terminfo on the server
+x            backups: create / restore
 r            re-check reachability
 s            SSH launcher settings
 ?            key reference
@@ -123,6 +132,39 @@ k / Up           previous launcher
 Enter            save selection
 Esc              cancel without saving
 ```
+
+## Backups
+
+A backup is one JSON file holding the whole profile: every server with its tags, pins, jump host, forwards, and connection history, plus the launcher setting. It contains no secrets, only key *paths*, so the key files themselves still need your normal backup.
+
+```bash
+lazyssh export                       # ~/.config/lazyssh/backups/lazyssh-backup-<UTC time>.json
+lazyssh export ~/sync/lazyssh.json   # anywhere you like
+lazyssh export - | gpg -c > lazyssh.json.gpg   # or pipe it
+
+lazyssh restore ~/sync/lazyssh.json            # merge: add servers whose name is new
+lazyssh restore ~/sync/lazyssh.json --replace  # make the profile an exact copy
+```
+
+- **Merge** (the default) never overwrites: a server whose name already exists is kept as it is and reported.
+- **Replace** swaps in the backup wholesale, launcher setting included.
+- Before any restore, the current profile is written to `backups/lazyssh-before-restore-<time>.json`, so a wrong restore can be undone by restoring that file.
+- A plain copy of an old `servers.json` restores too, and `lazyssh import` accepts backups as well as `~/.ssh/config`.
+
+In the TUI, `x` lists the backups folder newest first: `Enter` on **New backup** creates one, `Enter` on a backup merges it, `R` replaces the profile with it.
+
+## Terminal type on servers (`sudo su -` and Kitty)
+
+Kitty sets `TERM=xterm-kitty`. A server only understands that name if it has the matching *terminfo* entry; without it, `clear`, `vim`, `less`, `htop`, and `tmux` fail or draw garbage (`'xterm-kitty': unknown terminal type`).
+
+Kitty's `ssh` kitten fixes this by copying the entry into the login user's `~/.terminfo` for the session. That is why things work right after you connect, and break the moment you `sudo su - other-user`: the other user's home has no copy.
+
+`t` (or `lazyssh terminfo <name>`) fixes it at the source by installing the entry on the server permanently:
+
+- **All users** (default): compiles it into the system terminfo database with `sudo tic`, so every account (other users, root, tmux sessions, cron jobs) knows your terminal. sudo may ask for your password on the terminal; LazySSH never sees it.
+- **Just me** (`--user`): installs into the login user's `~/.terminfo`, for hosts where you have no sudo. This doesn't help after `sudo su -`.
+
+Your `TERM` is never changed or forced; the server simply learns what your terminal is. The entry comes from your local `infocmp`, travels base64-encoded over ssh, and is compiled by the server's own `tic`. It is safe to run again, and works for any terminal (WezTerm, foot, Alacritty, Ghostty…), not just Kitty. The server needs `tic`, which ships in `ncurses-bin` on Debian/Ubuntu and `ncurses` elsewhere.
 
 ## SSH launcher modes
 

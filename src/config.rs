@@ -71,6 +71,28 @@ impl Server {
     }
 }
 
+/// Writes `data` to `path` via a sibling temp file and a rename, so a crash
+/// or full disk mid-write never leaves a truncated config or backup behind.
+pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("{} is not a file path", path.display()))?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(file_name);
+    tmp_name.push(format!(".tmp-{}", std::process::id()));
+    let tmp = parent.join(tmp_name);
+    fs::write(&tmp, data).with_context(|| format!("failed to write {}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|err| {
+        let _ = fs::remove_file(&tmp);
+        anyhow::anyhow!("failed to replace {}: {err}", path.display())
+    })
+}
+
 /// Current Unix time in seconds, or 0 if the clock is before the epoch.
 pub fn now_unix_secs() -> u64 {
     SystemTime::now()
@@ -175,13 +197,7 @@ impl Config {
     }
 
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        let data = serde_json::to_string_pretty(self)?;
-        fs::write(path, data).with_context(|| format!("failed to write {}", path.display()))?;
-        Ok(())
+        write_atomic(path, serde_json::to_string_pretty(self)?.as_bytes())
     }
 
     pub fn add(&mut self, server: Server) {
@@ -470,6 +486,19 @@ mod tests {
 
         let loaded = Config::load_from(&path).unwrap();
         assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn atomic_write_replaces_and_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("servers.json");
+        write_atomic(&path, b"one").unwrap();
+        write_atomic(&path, b"two").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+        let entries: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1);
+        // A relative bare file name writes into the current directory.
+        assert!(write_atomic(Path::new(""), b"x").is_err());
     }
 
     #[test]
